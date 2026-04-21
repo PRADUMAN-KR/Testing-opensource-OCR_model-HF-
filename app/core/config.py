@@ -18,11 +18,11 @@ class Settings(BaseSettings):
     APP_NAME: str = "PaddleOCR Pipeline API"
     DEBUG: bool = False
 
-    # Only PaddleOCR v4 is supported; list kept for symmetry with future variants.
-    ENABLED_MODELS: List[str] = ["paddleocr_v4"]
+    # Single active OCR model backed by PaddleOCR PP-OCRv5.
+    ENABLED_MODELS: List[str] = ["paddleocr_v5"]
 
-    # Preset "all pure OCR" — only Paddle in this deployment.
-    OCR_WITHOUT_LLM_CAPABILITIES: List[str] = ["paddleocr_v4"]
+    # Preset retained for compatibility; resolves to the single active OCR model.
+    OCR_WITHOUT_LLM_CAPABILITIES: List[str] = ["paddleocr_v5"]
 
     PADDLE_USE_GPU: bool = False
     GPU_DEVICE_ID: int = 0

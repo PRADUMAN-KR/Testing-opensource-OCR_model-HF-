@@ -59,10 +59,10 @@ class ModelRegistry:
 
     def _build_model(self, name: str) -> Optional["BaseOCRModel"]:
         """Factory: maps model name → implementation class."""
-        if name == "paddleocr_v4":
-            from app.models.paddleocr_v4 import PaddleOCRv4Model
+        if name == "paddleocr_v5":
+            from app.models.paddleocr_v5 import PaddleOCRv5Model
 
-            return PaddleOCRv4Model(
+            return PaddleOCRv5Model(
                 use_gpu=settings.PADDLE_USE_GPU,
                 max_accuracy=settings.PADDLE_MAX_ACCURACY,
                 paddle_mem_fraction=settings.PADDLE_MEM_FRACTION,

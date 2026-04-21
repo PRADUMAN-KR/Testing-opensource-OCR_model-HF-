@@ -8,12 +8,12 @@ pydantic-settings>=2.3.0
 # ── System utilities ──────────────────────────────────
 psutil>=5.9.0
 Pillow>=10.3.0
-numpy>=1.26.0,<2.0.0
+numpy>=1.26.4
 pdf2image
 
 # PaddleOCR — install paddlepaddle / paddlepaddle-gpu for your OS/CUDA from:
 # https://www.paddlepaddle.org.cn/install/quick
-paddleocr>=3.0.0
+paddleocr>=3.4.0
 arabic-reshaper>=3.0.0
 python-bidi>=0.4.2
 
@@ -21,3 +21,10 @@ python-bidi>=0.4.2
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
 httpx>=0.27.0
+torch==2.9.0
+#---------
+# python3 -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
+
+--index-url https://pypi.org/simple
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu130/
+paddlepaddle-gpu==3.3.0

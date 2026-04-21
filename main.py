@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 
-from app.routers import ocr, benchmark, health
+from app.routers import ocr
+# from app.routers import benchmark, health
 from app.core.config import settings
 from app.core.model_registry import ModelRegistry
 
@@ -46,6 +47,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(health.router, prefix="/health", tags=["Health"])
 app.include_router(ocr.router, prefix="/ocr", tags=["OCR"])
-app.include_router(benchmark.router, prefix="/benchmark", tags=["Benchmark"])
+# app.include_router(health.router, prefix="/health", tags=["Health"])
+# app.include_router(benchmark.router, prefix="/benchmark", tags=["Benchmark"])

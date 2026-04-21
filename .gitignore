@@ -16,8 +16,8 @@ db.sqlite3
 media/
 
 # Environment variables
-.env
-.env.*
+# .env
+# .env.*
 
 # IDE
 .vscode/
@@ -50,3 +50,7 @@ build/
 # Coverage reports
 .coverage
 htmlcov/
+
+tests/
+test_image
+README.md

@@ -1,5 +1,5 @@
 """
-PaddleOCR PP-OCRv4/v5 — Tier 2
+PaddleOCR PP-OCRv5 — Tier 2
 
 Standard pipeline + F2 MAX-ACCURACY pipeline (enabled when max_accuracy=True):
 
@@ -115,7 +115,7 @@ _HIGHDPI_THRESHOLD_PX = 3000
 # Model class
 # ---------------------------------------------------------------------------
 
-class PaddleOCRv4Model(BaseOCRModel):
+class PaddleOCRv5Model(BaseOCRModel):
     """
     PaddleOCR wrapper with an optional F2 MAX-ACCURACY pipeline.
 
@@ -124,7 +124,7 @@ class PaddleOCRv4Model(BaseOCRModel):
     merges/scores results at the text-line level via bbox IoU alignment.
     """
 
-    name = "paddleocr_v4"
+    name = "paddleocr_v5"
     supported_languages = [
         SupportedLanguage.ENGLISH,
         SupportedLanguage.ARABIC,
