@@ -91,6 +91,9 @@ def _pages_from_metadata(metadata: dict) -> list[PageDetail]:
                 excluded_lines=excluded_lines,
                 per_line_confidence=page.get("per_line_confidence", []) or [],
                 per_line_noise_score=page.get("per_line_noise_score", []) or [],
+                layout_mode=str(page.get("layout_mode", "text")),
+                tables=page.get("tables", []) or [],
+                totals=page.get("totals", {}) or {},
                 avg_confidence=float(page.get("avg_confidence", 0.0)),
             )
         )
@@ -155,6 +158,9 @@ async def run_ocr(
     confidence_score = float(result.metadata.get("confidence_score", result.avg_confidence))
     debug_lines = result.metadata.get("debug_lines", []) or []
     debug_blocks = result.metadata.get("debug_blocks", []) or []
+    layout_mode = str(result.metadata.get("layout_mode", "text"))
+    tables = result.metadata.get("tables", []) or []
+    totals = result.metadata.get("totals", {}) or {}
     per_line_confidence = result.metadata.get("per_line_confidence", []) or []
     per_line_noise_score = result.metadata.get("per_line_noise_score", []) or []
     rejected_bbox_lines = result.metadata.get("rejected_bbox_lines", []) or []
@@ -169,6 +175,9 @@ async def run_ocr(
         confidence_score=confidence_score,
         debug_lines=debug_lines,
         debug_blocks=debug_blocks,
+        layout_mode=layout_mode,
+        tables=tables,
+        totals=totals,
         rejected_bbox_lines=rejected_bbox_lines,
         corrected_bbox_lines=corrected_bbox_lines,
         words=[WordDetail(text=w.text, confidence=w.confidence, bbox=w.bbox) for w in result.words],
@@ -199,6 +208,9 @@ async def run_ocr(
         confidence_score=confidence_score,
         debug_lines=debug_lines,
         debug_blocks=debug_blocks,
+        layout_mode=layout_mode,
+        tables=tables,
+        totals=totals,
         rejected_bbox_lines=rejected_bbox_lines,
         corrected_bbox_lines=corrected_bbox_lines,
         pages=pages,

@@ -443,6 +443,99 @@ class PaddleOCRv5Model(BaseOCRModel):
         except Exception as exc:
             logger.debug("[PaddleOCR] GPU cache clear skipped on page %d: %s", page_idx, exc)
 
+    @staticmethod
+    def _detect_table_grid_image(img_rgb: np.ndarray) -> dict:
+        """
+        Detect receipt/table grid structure before OCR. This deliberately runs
+        on the uncropped camera frame so the input ROI stage does not mistake an
+        inner table for the whole document.
+        """
+        try:
+            if img_rgb is None or img_rgb.size == 0:
+                raise ValueError("empty image")
+            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+            h, w = gray.shape[:2]
+            if h <= 0 or w <= 0:
+                raise ValueError("empty image")
+            binary = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY_INV,
+                31,
+                12,
+            )
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, w // 18), 1))
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, h // 18)))
+            horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+            vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+
+            def count_lines(mask: np.ndarray, orientation: str) -> int:
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                count = 0
+                for cnt in contours:
+                    x, y, bw, bh = cv2.boundingRect(cnt)
+                    if orientation == "horizontal":
+                        if bw >= w * 0.16 and bw >= bh * 5:
+                            count += 1
+                    elif bh >= h * 0.10 and bh >= bw * 5:
+                        count += 1
+                return count
+
+            horizontal_count = count_lines(horizontal, "horizontal")
+            vertical_count = count_lines(vertical, "vertical")
+            table_mode = horizontal_count >= 4 and vertical_count >= 3
+            return {
+                "table_mode": table_mode,
+                "horizontal_line_count": horizontal_count,
+                "vertical_line_count": vertical_count,
+            }
+        except Exception as exc:
+            return {
+                "table_mode": False,
+                "horizontal_line_count": 0,
+                "vertical_line_count": 0,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _safe_document_crop_reason(
+        bbox: list[int] | tuple[int, int, int, int],
+        img_shape: tuple[int, ...],
+    ) -> str | None:
+        """
+        Return None when a proposed ROI plausibly preserves the whole document.
+        Otherwise return a rejection reason. This prevents inner tables,
+        bordered sections, or content boxes from replacing the full page.
+        """
+        h, w = img_shape[:2]
+        if h <= 0 or w <= 0:
+            return "invalid_image_shape"
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        bw = max(0.0, x2 - x1)
+        bh = max(0.0, y2 - y1)
+        if bw < 32 or bh < 32:
+            return "roi_too_small"
+        area_ratio = (bw * bh) / float(w * h)
+        width_ratio = bw / float(w)
+        height_ratio = bh / float(h)
+        top_margin_ratio = y1 / float(h)
+        bottom_margin_ratio = (h - y2) / float(h)
+        left_margin_ratio = x1 / float(w)
+        right_margin_ratio = (w - x2) / float(w)
+
+        if area_ratio < 0.35:
+            return "roi_area_too_small_for_full_document"
+        if height_ratio < 0.58:
+            return "roi_height_too_small_for_full_document"
+        if width_ratio < 0.45:
+            return "roi_width_too_small_for_full_document"
+        if top_margin_ratio > 0.18 and bottom_margin_ratio > 0.18:
+            return "roi_likely_inner_content_vertical"
+        if left_margin_ratio > 0.20 and right_margin_ratio > 0.20:
+            return "roi_likely_inner_content_horizontal"
+        return None
+
     # ------------------------------------------------------------------
     # Input pipeline — document ROI (before detection)
     # ------------------------------------------------------------------
@@ -550,6 +643,18 @@ class PaddleOCRv5Model(BaseOCRModel):
             meta["page_crop_reason"] = "image_too_small"
             return img_rgb, meta
 
+        table_grid = self._detect_table_grid_image(img_rgb)
+        meta["receipt_table_grid"] = table_grid
+        if table_grid.get("table_mode"):
+            meta["roi_warp_reason"] = "receipt_table_preserve_full_image"
+            meta["page_crop_reason"] = "receipt_table_preserve_full_image"
+            logger.info(
+                "[PaddleOCR] Receipt/table grid detected before ROI; preserving full image (h=%s v=%s)",
+                table_grid.get("horizontal_line_count", 0),
+                table_grid.get("vertical_line_count", 0),
+            )
+            return img_rgb, meta
+
         bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -576,6 +681,21 @@ class PaddleOCRv5Model(BaseOCRModel):
 
         if quad is None:
             meta["roi_warp_reason"] = "no_suitable_quad"
+            return self._apply_bright_page_crop_fallback(img_rgb, gray, language, meta)
+
+        qx1 = int(np.min(quad[:, 0]))
+        qy1 = int(np.min(quad[:, 1]))
+        qx2 = int(np.max(quad[:, 0]))
+        qy2 = int(np.max(quad[:, 1]))
+        unsafe_reason = self._safe_document_crop_reason([qx1, qy1, qx2, qy2], img_rgb.shape)
+        if unsafe_reason:
+            meta["roi_warp_reason"] = f"rejected_{unsafe_reason}"
+            meta["roi_warp_candidate_bbox"] = [qx1, qy1, qx2, qy2]
+            logger.info(
+                "[PaddleOCR] ROI warp rejected; preserving full image (%s bbox=%s)",
+                unsafe_reason,
+                meta["roi_warp_candidate_bbox"],
+            )
             return self._apply_bright_page_crop_fallback(img_rgb, gray, language, meta)
 
         ordered = self._order_quad_points(quad)
@@ -628,6 +748,16 @@ class PaddleOCRv5Model(BaseOCRModel):
             meta["page_crop_reason"] = "no_bright_page_rect"
             return img_rgb, meta
         x1, y1, x2, y2 = rect
+        unsafe_reason = self._safe_document_crop_reason([x1, y1, x2, y2], img_rgb.shape)
+        if unsafe_reason:
+            meta["page_crop_reason"] = f"rejected_{unsafe_reason}"
+            meta["page_crop_candidate_bbox"] = [int(x1), int(y1), int(x2), int(y2)]
+            logger.info(
+                "[PaddleOCR] Bright-page crop rejected; preserving full image (%s bbox=%s)",
+                unsafe_reason,
+                meta["page_crop_candidate_bbox"],
+            )
+            return img_rgb, meta
         cropped = img_rgb[y1:y2, x1:x2]
         if cropped.size == 0:
             meta["page_crop_reason"] = "empty_crop"
@@ -711,10 +841,14 @@ class PaddleOCRv5Model(BaseOCRModel):
         """
         Generate full-page preprocessing variants.
 
-        Arabic variants are intentionally limited and ordered:
+        Arabic text variants are intentionally limited and ordered:
           - original
           - deskew_clahe
           - sharpen_contrast
+
+        Receipt/table-like Arabic pages add targeted variants because grid
+        borders, rotated camera capture, and numeric cells benefit from
+        stronger local contrast and moderate upscaling.
 
         Returns list of (name, scale_factor, image_rgb).
         scale_factor is relative to the original.
@@ -734,6 +868,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         # Arabic-specific variants (only added when language == ARABIC)
         # ------------------------------------------------------------------
         if language == SupportedLanguage.ARABIC:
+            table_grid = self._detect_table_grid_image(img_rgb)
             # 1) deskew + CLAHE: rotate first so contrast enhancement operates
             # on the corrected text baselines.
             skew = self._estimate_skew_angle(gray)
@@ -761,6 +896,47 @@ class PaddleOCRv5Model(BaseOCRModel):
                 1.0,
                 cv2.cvtColor(cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
             ))
+
+            if table_grid.get("table_mode"):
+                receipt_clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(6, 6)).apply(gray)
+                receipt_blur = cv2.GaussianBlur(receipt_clahe, (0, 0), 0.8)
+                receipt_sharp = cv2.addWeighted(receipt_clahe, 1.35, receipt_blur, -0.35, 0)
+                variants.append((
+                    "receipt_grid_clahe_sharp",
+                    1.0,
+                    cv2.cvtColor(cv2.cvtColor(receipt_sharp, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
+                ))
+
+                receipt_binary = cv2.adaptiveThreshold(
+                    receipt_clahe,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    31,
+                    9,
+                )
+                variants.append((
+                    "receipt_adaptive_binary",
+                    1.0,
+                    cv2.cvtColor(cv2.cvtColor(receipt_binary, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
+                ))
+
+                scale_15 = 1.5
+                up_w = max(1, int(w * scale_15))
+                up_h = max(1, int(h * scale_15))
+                receipt_upscaled = cv2.resize(
+                    cv2.cvtColor(cv2.cvtColor(receipt_sharp, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
+                    (up_w, up_h),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                variants.append(("receipt_upscaled_1_5x", scale_15, receipt_upscaled))
+
+                logger.info(
+                    "[PaddleOCR F2] Receipt/table variants enabled: h=%s v=%s total_variants=%d",
+                    table_grid.get("horizontal_line_count", 0),
+                    table_grid.get("vertical_line_count", 0),
+                    len(variants),
+                )
             return variants
 
         # Non-Arabic max-accuracy behavior keeps the previous simple diversity.
@@ -2387,6 +2563,9 @@ class PaddleOCRv5Model(BaseOCRModel):
             postprocess_page_results: list[dict] = []
             debug_lines: list[dict] = []
             debug_blocks: list[dict] = []
+            tables: list[dict] = []
+            totals: dict[str, str] = {}
+            layout_modes: list[str] = []
             review_lines: list[dict] = []
             excluded_noise_lines: list[dict] = []
             per_line_confidence: list[dict] = []
@@ -2408,6 +2587,7 @@ class PaddleOCRv5Model(BaseOCRModel):
                         raw_text=page.get("raw_text", original_page_text),
                         selected_variant=page_diag.get("selected_variant") or "original",
                         variant_scores=page_diag.get("variant_scores", []),
+                        image_rgb=pages[page_idx] if 0 <= page_idx < len(pages) else None,
                     )
                     processed_page_text = post_result["text"]
                     page["text_before_postprocess"] = original_page_text
@@ -2422,6 +2602,9 @@ class PaddleOCRv5Model(BaseOCRModel):
                     page["per_line_noise_score"] = post_result["per_line_noise_score"]
                     page["debug_lines"] = post_result["debug_lines"]
                     page["debug_blocks"] = post_result["debug_blocks"]
+                    page["layout_mode"] = post_result.get("layout_mode", "text")
+                    page["tables"] = post_result.get("tables", [])
+                    page["totals"] = post_result.get("totals", {})
                     if processed_page_text:
                         page["text"] = processed_page_text
                         postprocess_applied = True
@@ -2449,6 +2632,13 @@ class PaddleOCRv5Model(BaseOCRModel):
                         debug_block = dict(block)
                         debug_block["page_index"] = page_idx
                         debug_blocks.append(debug_block)
+                    for table in post_result.get("tables", []):
+                        table_item = dict(table)
+                        table_item["page_index"] = page_idx
+                        tables.append(table_item)
+                    for key, value in (post_result.get("totals", {}) or {}).items():
+                        totals[key] = value
+                    layout_modes.append(str(post_result.get("layout_mode", "text")))
                     confidence_scores.append(float(post_result.get("confidence_score", 0.0)))
                     if post_result.get("selected_variant"):
                         selected_variants.append(str(post_result["selected_variant"]))
@@ -2514,6 +2704,14 @@ class PaddleOCRv5Model(BaseOCRModel):
                 ) if confidence_scores else round(avg_conf, 4),
                 "debug_lines": debug_lines,
                 "debug_blocks": debug_blocks,
+                "layout_mode": (
+                    "table"
+                    if layout_modes and all(mode == "table" for mode in layout_modes)
+                    else "mixed" if any(mode == "table" for mode in layout_modes)
+                    else "text"
+                ),
+                "tables": tables,
+                "totals": totals,
                 "rejected_bbox_lines": rejected_bbox_lines,
                 "corrected_bbox_lines": corrected_bbox_lines,
                 "review_lines": review_lines,

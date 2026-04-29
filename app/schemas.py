@@ -45,6 +45,9 @@ class PageDetail(BaseModel):
     excluded_lines: List[LineDetail] = Field(default_factory=list)
     per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
     per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
+    layout_mode: str = "text"
+    tables: List[Dict[str, Any]] = Field(default_factory=list)
+    totals: Dict[str, Any] = Field(default_factory=dict)
     avg_confidence: float = 0.0
 
 
@@ -58,6 +61,9 @@ class ModelResult(BaseModel):
     confidence_score: float = 0.0
     debug_lines: List[Dict[str, Any]] = Field(default_factory=list)
     debug_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    layout_mode: str = "text"
+    tables: List[Dict[str, Any]] = Field(default_factory=list)
+    totals: Dict[str, Any] = Field(default_factory=dict)
     rejected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
     corrected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
     words: List[WordDetail]
@@ -94,6 +100,9 @@ class OCRResponse(BaseModel):
     confidence_score: float = 0.0
     debug_lines: List[Dict[str, Any]] = Field(default_factory=list)
     debug_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    layout_mode: str = "text"
+    tables: List[Dict[str, Any]] = Field(default_factory=list)
+    totals: Dict[str, Any] = Field(default_factory=dict)
     rejected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
     corrected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
     pages: List[PageDetail] = Field(default_factory=list)
