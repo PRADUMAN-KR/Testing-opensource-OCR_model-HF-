@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from enum import Enum
 
 
@@ -17,15 +17,63 @@ class WordDetail(BaseModel):
     bbox: Optional[List[int]] = None
 
 
+class LineDetail(BaseModel):
+    page_index: int
+    line_index: int
+    text: str
+    raw_text: str
+    confidence: float
+    bbox: Optional[List[int]] = None
+    bbox_source: Dict[str, Any] = Field(default_factory=dict)
+    bbox_valid: bool = True
+    status: Optional[str] = None
+    noise_score: Optional[float] = None
+    filter_reason: Optional[str] = None
+    exclude_reason: Optional[str] = None
+
+
+class PageDetail(BaseModel):
+    page_index: int
+    text: str
+    raw_text: str
+    lines: List[LineDetail] = Field(default_factory=list)
+    accepted_lines: List[LineDetail] = Field(default_factory=list)
+    review_lines: List[LineDetail] = Field(default_factory=list)
+    flagged_lines: List[LineDetail] = Field(default_factory=list)
+    filtered_lines: List[LineDetail] = Field(default_factory=list)
+    excluded_noise_lines: List[LineDetail] = Field(default_factory=list)
+    excluded_lines: List[LineDetail] = Field(default_factory=list)
+    per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
+    per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
+    avg_confidence: float = 0.0
+
+
 class ModelResult(BaseModel):
     model_name: str
     language: str
+    final_text: str = ""
+    text: str = ""
     raw_text: str
+    selected_variant: Optional[str] = None
+    confidence_score: float = 0.0
+    debug_lines: List[Dict[str, Any]] = Field(default_factory=list)
+    debug_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    rejected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
+    corrected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
     words: List[WordDetail]
+    pages: List[PageDetail] = Field(default_factory=list)
+    accepted_lines: List[LineDetail] = Field(default_factory=list)
+    review_lines: List[LineDetail] = Field(default_factory=list)
+    flagged_lines: List[LineDetail] = Field(default_factory=list)
+    excluded_noise_lines: List[LineDetail] = Field(default_factory=list)
+    excluded_lines: List[LineDetail] = Field(default_factory=list)
+    per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
+    per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
     inference_time_ms: float
     avg_confidence: float
     error: Optional[str] = None
-    metadata: Dict = {}
+    quality: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict = Field(default_factory=dict)
 
 
 class OCRRequest(BaseModel):
@@ -39,6 +87,25 @@ class OCRRequest(BaseModel):
 class OCRResponse(BaseModel):
     filename: str
     language: str
+    final_text: str = ""
+    text: str = ""
+    raw_text: str = ""
+    selected_variant: Optional[str] = None
+    confidence_score: float = 0.0
+    debug_lines: List[Dict[str, Any]] = Field(default_factory=list)
+    debug_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    rejected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
+    corrected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
+    pages: List[PageDetail] = Field(default_factory=list)
+    accepted_lines: List[LineDetail] = Field(default_factory=list)
+    review_lines: List[LineDetail] = Field(default_factory=list)
+    flagged_lines: List[LineDetail] = Field(default_factory=list)
+    excluded_noise_lines: List[LineDetail] = Field(default_factory=list)
+    excluded_lines: List[LineDetail] = Field(default_factory=list)
+    per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
+    per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
+    avg_confidence: float = 0.0
+    quality: Dict[str, Any] = Field(default_factory=dict)
     results: List[ModelResult]
     models_run: int
     total_time_ms: float

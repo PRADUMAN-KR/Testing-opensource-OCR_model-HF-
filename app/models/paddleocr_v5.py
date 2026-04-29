@@ -3,18 +3,13 @@ PaddleOCR PP-OCRv5 — Tier 2
 
 Standard pipeline + F2 MAX-ACCURACY pipeline (enabled when max_accuracy=True):
 
-  Stage 1 — Full-page variants (original, 2x, CLAHE,
-             + Arabic-specific: adaptive_thresh, ink_bleed, deskewed,
-               downscaled_0.75x [for high-DPI inputs])
+  Stage 1 — Full-page variants (Arabic: original, deskew+CLAHE,
+             light sharpen+contrast; non-Arabic keeps original, 2x, CLAHE)
   Stage 2 — Run full engine.ocr() on each variant × each engine
-  Stage 3 — Pick best complete pass (scored; upscaled variant lightly penalised)
-             Score function is Arabic-aware: token-based counting, ligature
-             compensation, mixed-page detection, diacritic-density gating.
-  Stage 4  — Column-aware RTL line ordering with dynamic band tolerance derived
-             from median box height.
-  Stage 5  — Full Arabic text correction: kashida removal, Alef normalization
-             (opt-in), diacritic deduplication, punctuation normalization,
-             isolated-letter noise filtering, ZWNJ/ZWJ/BOM stripping.
+  Stage 3 — Pick best complete pass using deterministic confidence, Arabic word
+             count, dictionary coverage, low-confidence, and broken-word scoring.
+  Stage 4  — Block/column-aware RTL layout reconstruction.
+  Stage 5  — Conservative Arabic cleanup without inventing missing OCR words.
 
 Supports: English, Arabic, Hindi
 Install:  pip install paddlepaddle paddleocr opencv-python python-bidi arabic-reshaper
@@ -26,6 +21,7 @@ import os
 import re
 import statistics
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +31,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 from app.models.base import BaseOCRModel, OCRResult, OCRWord, SupportedLanguage
 from app.core.document import load_document_as_rgb_images
+from app.ocr_postprocess import line_noise_score, postprocess_ocr_result, score_ocr_words
+from app.ocr_postprocess.utils import split_line_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +143,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         fallback_min_ar_ratio: float = 0.60,
         fallback_replace_margin: float = 0.03,
         input_roi_warp: bool = False,
+        arabic_auto_page_crop: bool = True,
         roi_min_area_ratio: float = 0.15,
         roi_pad_ratio: float = 0.02,
         paddle_mem_fraction: float | None = None,
@@ -152,6 +151,9 @@ class PaddleOCRv5Model(BaseOCRModel):
         paddle_gpu_memory_fraction: float | None = None,
         empty_cache_between_pages: bool = False,
         det_limit_side_len: int | None = None,
+        text_det_thresh: float = 0.3,
+        text_det_box_thresh: float = 0.45,
+        text_rec_score_thresh: float = 0.3,
         precision: str = "fp32",
         enable_fp16: bool = False,
         use_tensorrt: bool = False,
@@ -184,6 +186,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         self.fallback_replace_margin = fallback_replace_margin
         # Optional: largest-quad perspective warp before OCR (napkin / document on clutter).
         self.input_roi_warp = input_roi_warp
+        self.arabic_auto_page_crop = arabic_auto_page_crop
         self.roi_min_area_ratio = roi_min_area_ratio
         self.roi_pad_ratio = roi_pad_ratio
         self.paddle_mem_fraction = paddle_mem_fraction
@@ -191,6 +194,9 @@ class PaddleOCRv5Model(BaseOCRModel):
         self.paddle_gpu_memory_fraction = paddle_gpu_memory_fraction
         self.empty_cache_between_pages = empty_cache_between_pages
         self.det_limit_side_len = det_limit_side_len
+        self.text_det_thresh = text_det_thresh
+        self.text_det_box_thresh = text_det_box_thresh
+        self.text_rec_score_thresh = text_rec_score_thresh
         requested_precision = (precision or "fp32").strip().lower()
         if requested_precision not in {"fp32", "fp16", "bf16"}:
             logger.warning(
@@ -260,9 +266,9 @@ class PaddleOCRv5Model(BaseOCRModel):
             "lang": paddle_lang,
             "device": self._device,
             "ocr_version": ocr_version,
-            "text_det_thresh": 0.5,
-            "text_det_box_thresh": 0.7,
-            "text_rec_score_thresh": 0.5,
+            "text_det_thresh": self.text_det_thresh,
+            "text_det_box_thresh": self.text_det_box_thresh,
+            "text_rec_score_thresh": self.text_rec_score_thresh,
         }
         if self.use_gpu:
             if self.precision != "fp32":
@@ -279,13 +285,16 @@ class PaddleOCRv5Model(BaseOCRModel):
 
         try:
             logger.info(
-                "[PaddleOCR] Engine kwargs: lang=%s ocr_version=%s precision=%s use_tensorrt=%s det_limit_side_len=%s limit_side_len=%s",
+                "[PaddleOCR] Engine kwargs: lang=%s ocr_version=%s precision=%s use_tensorrt=%s det_limit_side_len=%s limit_side_len=%s det_thresh=%s box_thresh=%s rec_thresh=%s",
                 paddle_lang,
                 ocr_version,
                 kwargs.get("precision", "fp32"),
                 kwargs.get("use_tensorrt", False),
                 kwargs.get("det_limit_side_len"),
                 kwargs.get("limit_side_len"),
+                kwargs.get("text_det_thresh"),
+                kwargs.get("text_det_box_thresh"),
+                kwargs.get("text_rec_score_thresh"),
             )
             engine = self._paddleocr_cls(**kwargs)
             logger.info(
@@ -350,6 +359,20 @@ class PaddleOCRv5Model(BaseOCRModel):
             if "limit_side_len" in kwargs and "limit_side_len" in msg:
                 kwargs.pop("limit_side_len", None)
                 retried = True
+
+            for threshold_key in (
+                "text_det_thresh",
+                "text_det_box_thresh",
+                "text_rec_score_thresh",
+            ):
+                if threshold_key in kwargs and threshold_key in msg:
+                    logger.warning(
+                        "[PaddleOCR] %s unsupported by current PaddleOCR build; falling back: %s",
+                        threshold_key,
+                        exc,
+                    )
+                    kwargs.pop(threshold_key, None)
+                    retried = True
 
             if retried:
                 engine = self._paddleocr_cls(**kwargs)
@@ -437,12 +460,86 @@ class PaddleOCRv5Model(BaseOCRModel):
         rect[3] = pts[np.argmax(diff)]
         return rect
 
-    def _apply_document_roi_warp(self, img_rgb: np.ndarray) -> tuple[np.ndarray, dict]:
+    def _find_bright_page_rect(self, gray: np.ndarray) -> tuple[int, int, int, int] | None:
+        """
+        Fallback page detector for camera photos where page edges are faint and
+        Canny/approxPoly misses the quad. It looks for the largest bright,
+        page-shaped connected component, which works well for book pages on
+        darker desks and excludes adjacent side pages.
+        """
+        h, w = gray.shape[:2]
+        img_area = float(h * w)
+        min_area = max(self.roi_min_area_ratio * img_area, 0.08 * img_area)
+        max_area = 0.92 * img_area
+        best: tuple[float, int, int, int, int] | None = None
+
+        for thresh in (205, 195, 185, 175, 165):
+            mask = cv2.inRange(gray, thresh, 255)
+            close_k = max(9, int(min(h, w) * 0.025))
+            open_k = max(5, int(min(h, w) * 0.010))
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_CLOSE,
+                np.ones((close_k, close_k), np.uint8),
+                iterations=1,
+            )
+            mask = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_OPEN,
+                np.ones((open_k, open_k), np.uint8),
+                iterations=1,
+            )
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_area or area > max_area:
+                    continue
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                if bw <= 0 or bh <= 0:
+                    continue
+                aspect = bw / float(bh)
+                extent = area / float(bw * bh)
+                touches_left_and_right = x <= 2 and x + bw >= w - 2
+                touches_top_and_bottom = y <= 2 and y + bh >= h - 2
+                if touches_left_and_right and touches_top_and_bottom:
+                    continue
+                if not (0.42 <= aspect <= 0.95):
+                    continue
+                if extent < 0.55:
+                    continue
+                score = area * (1.0 - min(0.5, abs(aspect - 0.66)))
+                if best is None or score > best[0]:
+                    best = (score, x, y, bw, bh)
+            if best is not None:
+                break
+
+        if best is None:
+            return None
+        _, x, y, bw, bh = best
+        pad = max(4, int(self.roi_pad_ratio * max(bw, bh)))
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(w, x + bw + pad)
+        y2 = min(h, y + bh + pad)
+        if x2 - x1 < 32 or y2 - y1 < 32:
+            return None
+        return x1, y1, x2, y2
+
+    def _apply_document_roi_warp(
+        self,
+        img_rgb: np.ndarray,
+        language: SupportedLanguage | None = None,
+    ) -> tuple[np.ndarray, dict]:
         """
         Find largest plausible document quad (Canny → contours → approxPoly)
         and apply perspective warp. Falls back to original image on failure.
         """
-        meta: dict = {"roi_warp_applied": False, "roi_warp_reason": "disabled"}
+        meta: dict = {
+            "roi_warp_applied": False,
+            "roi_warp_reason": "disabled",
+            "page_crop_applied": False,
+            "page_crop_reason": "disabled",
+        }
         if not self.input_roi_warp:
             return img_rgb, meta
 
@@ -450,6 +547,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         img_area = float(h * w)
         if img_area < 5000:
             meta["roi_warp_reason"] = "image_too_small"
+            meta["page_crop_reason"] = "image_too_small"
             return img_rgb, meta
 
         bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
@@ -461,7 +559,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             meta["roi_warp_reason"] = "no_contours"
-            return img_rgb, meta
+            return self._apply_bright_page_crop_fallback(img_rgb, gray, language, meta)
 
         contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
         min_area = self.roi_min_area_ratio * img_area
@@ -478,7 +576,7 @@ class PaddleOCRv5Model(BaseOCRModel):
 
         if quad is None:
             meta["roi_warp_reason"] = "no_suitable_quad"
-            return img_rgb, meta
+            return self._apply_bright_page_crop_fallback(img_rgb, gray, language, meta)
 
         ordered = self._order_quad_points(quad)
         (tl, tr, br, bl) = ordered
@@ -504,12 +602,49 @@ class PaddleOCRv5Model(BaseOCRModel):
         out_rgb = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2RGB)
         meta["roi_warp_applied"] = True
         meta["roi_warp_reason"] = "ok"
+        meta["page_crop_reason"] = "roi_warp_applied"
         meta["roi_warp_size"] = [out_rgb.shape[1], out_rgb.shape[0]]
         logger.info(
             "[PaddleOCR] ROI warp applied: %dx%d → %dx%d (pad=%d)",
             w, h, out_rgb.shape[1], out_rgb.shape[0], pad,
         )
         return out_rgb, meta
+
+    def _apply_bright_page_crop_fallback(
+        self,
+        img_rgb: np.ndarray,
+        gray: np.ndarray,
+        language: SupportedLanguage | None,
+        meta: dict,
+    ) -> tuple[np.ndarray, dict]:
+        if language not in (None, SupportedLanguage.ARABIC):
+            meta["page_crop_reason"] = "not_arabic"
+            return img_rgb, meta
+        if not self.arabic_auto_page_crop:
+            meta["page_crop_reason"] = "disabled"
+            return img_rgb, meta
+        rect = self._find_bright_page_rect(gray)
+        if rect is None:
+            meta["page_crop_reason"] = "no_bright_page_rect"
+            return img_rgb, meta
+        x1, y1, x2, y2 = rect
+        cropped = img_rgb[y1:y2, x1:x2]
+        if cropped.size == 0:
+            meta["page_crop_reason"] = "empty_crop"
+            return img_rgb, meta
+        meta["page_crop_applied"] = True
+        meta["page_crop_reason"] = "roi_fallback_bright_page_rect"
+        meta["page_crop_bbox"] = [int(x1), int(y1), int(x2), int(y2)]
+        meta["page_crop_size"] = [int(cropped.shape[1]), int(cropped.shape[0])]
+        logger.info(
+            "[PaddleOCR] Bright-page crop applied: %dx%d → %dx%d bbox=%s",
+            img_rgb.shape[1],
+            img_rgb.shape[0],
+            cropped.shape[1],
+            cropped.shape[0],
+            meta["page_crop_bbox"],
+        )
+        return cropped, meta
 
     # ------------------------------------------------------------------
     # Stage 1 — Full-page preprocessing variants
@@ -576,17 +711,13 @@ class PaddleOCRv5Model(BaseOCRModel):
         """
         Generate full-page preprocessing variants.
 
-        For Arabic, additional variants are produced:
-          - adaptive_thresh : Sauvola-style adaptive binarization — preserves
-            tashkeel thin strokes that CLAHE can smear.
-          - ink_bleed_clean  : morphological opening to suppress show-through
-            between lines (common in scanned/photocopied Arabic documents).
-          - deskewed         : Hough-based rotation correction (±10° clamp).
-          - downscaled_0.75x : Only for high-DPI inputs (max dim > 3000 px);
-            counteracts the 2× upscale benefit reversal on already-dense text.
+        Arabic variants are intentionally limited and ordered:
+          - original
+          - deskew_clahe
+          - sharpen_contrast
 
         Returns list of (name, scale_factor, image_rgb).
-        scale_factor is relative to the original (1.0 = same size, 2.0 = 2x).
+        scale_factor is relative to the original.
         """
         variants: list[tuple[str, float, np.ndarray]] = []
 
@@ -594,64 +725,52 @@ class PaddleOCRv5Model(BaseOCRModel):
 
         h, w = img_rgb.shape[:2]
 
-        # Upscale — always generated; lightly penalised in scorer.
-        up = cv2.resize(img_rgb, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-        variants.append(("upscaled_2x", 2.0, up))
-
         bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-        # CLAHE — contrast enhancement, good for faded / low-contrast scans.
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        clahe_gray = clahe.apply(gray)
-        variants.append((
-            "clahe", 1.0,
-            cv2.cvtColor(cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
-        ))
 
         # ------------------------------------------------------------------
         # Arabic-specific variants (only added when language == ARABIC)
         # ------------------------------------------------------------------
         if language == SupportedLanguage.ARABIC:
-
-            # 1) Adaptive threshold — preserves diacritics (tashkeel) thin strokes
-            #    that CLAHE can smear.  Block size 11 px works well for 150–300 DPI.
-            adaptive = cv2.adaptiveThreshold(
-                gray, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                blockSize=11, C=6,
-            )
-            adaptive_rgb = cv2.cvtColor(
-                cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB
-            )
-            variants.append(("adaptive_thresh", 1.0, adaptive_rgb))
-
-            # 2) Ink-bleed removal — morphological opening with a 1-row horizontal
-            #    structuring element removes horizontal smear between lines while
-            #    preserving connected Arabic strokes.
-            ink_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
-            ink_clean = cv2.morphologyEx(gray, cv2.MORPH_OPEN, ink_kernel, iterations=1)
-            ink_rgb = cv2.cvtColor(
-                cv2.cvtColor(ink_clean, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB
-            )
-            variants.append(("ink_bleed_clean", 1.0, ink_rgb))
-
-            # 3) Deskewed — correct small rotations from scanner/camera misalignment.
+            # 1) deskew + CLAHE: rotate first so contrast enhancement operates
+            # on the corrected text baselines.
             skew = self._estimate_skew_angle(gray)
+            deskewed_rgb = self._rotate_image(img_rgb, -skew) if abs(skew) >= 0.2 else img_rgb
             if abs(skew) >= 0.2:
-                deskewed_rgb = self._rotate_image(img_rgb, -skew)
-                variants.append(("deskewed", 1.0, deskewed_rgb))
                 logger.debug("[PaddleOCR] Deskew applied: %.2f°", skew)
+            deskewed_gray = cv2.cvtColor(
+                cv2.cvtColor(deskewed_rgb, cv2.COLOR_RGB2BGR),
+                cv2.COLOR_BGR2GRAY,
+            )
+            deskew_clahe = clahe.apply(deskewed_gray)
+            variants.append((
+                "deskew_clahe",
+                1.0,
+                cv2.cvtColor(cv2.cvtColor(deskew_clahe, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
+            ))
 
-            # 4) High-DPI downscale — large images cause the 2× upscale to be
-            #    counter-productive; a 0.75× pass gives a different receptive field.
-            if max(h, w) > _HIGHDPI_THRESHOLD_PX:
-                dw = int(w * 0.75)
-                dh = int(h * 0.75)
-                downscaled = cv2.resize(img_rgb, (dw, dh), interpolation=cv2.INTER_AREA)
-                variants.append(("downscaled_0.75x", 0.75, downscaled))
-                logger.debug("[PaddleOCR] High-DPI downscale variant added (%dx%d → %dx%d)", w, h, dw, dh)
+            # 2) light sharpen + contrast: conservative unsharp masking; no
+            # binarization, so faint dots and Arabic strokes are not deleted.
+            contrast = cv2.convertScaleAbs(gray, alpha=1.12, beta=3)
+            blur = cv2.GaussianBlur(contrast, (0, 0), 1.0)
+            sharpened = cv2.addWeighted(contrast, 1.25, blur, -0.25, 0)
+            variants.append((
+                "sharpen_contrast",
+                1.0,
+                cv2.cvtColor(cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
+            ))
+            return variants
+
+        # Non-Arabic max-accuracy behavior keeps the previous simple diversity.
+        up = cv2.resize(img_rgb, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+        variants.append(("upscaled_2x", 2.0, up))
+        clahe_gray = clahe.apply(gray)
+        variants.append((
+            "clahe", 1.0,
+            cv2.cvtColor(cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
+        ))
 
         return variants
 
@@ -687,6 +806,7 @@ class PaddleOCRv5Model(BaseOCRModel):
             return []
 
         all_passes: list[tuple[str, str, list[tuple[str, float, list[int]]]]] = []
+        bbox_sanity = getattr(self, "_bbox_sanity_current", None)
 
         for variant_name, scale, variant_img in variants:
             # Hard-cap very large inputs to control VRAM.
@@ -720,15 +840,44 @@ class PaddleOCRv5Model(BaseOCRModel):
                 try:
                     result = engine.ocr(variant_for_engine)
                     parsed = self._parse_ocr_page(result[0]) if result and result[0] else []
-                    if effective_scale != 1.0 and parsed:
-                        inv = 1.0 / effective_scale
-                        parsed = [
-                            (text, conf, [
-                                int(bbox[0] * inv), int(bbox[1] * inv),
-                                int(bbox[2] * inv), int(bbox[3] * inv),
-                            ])
-                            for text, conf, bbox in parsed
+                    normalized = []
+                    inv = 1.0 / effective_scale if effective_scale else 1.0
+                    for text, conf, bbox in parsed:
+                        original_bbox = [
+                            bbox[0] * inv,
+                            bbox[1] * inv,
+                            bbox[2] * inv,
+                            bbox[3] * inv,
                         ]
+                        normalized.append(self._line_with_bbox_source(
+                            text,
+                            conf,
+                            original_bbox,
+                            variant_name=variant_name,
+                            scale=scale,
+                            effective_scale=effective_scale,
+                            original_bbox_before_rescale=bbox,
+                            img_shape=img_rgb.shape,
+                            engine_name=engine_name,
+                        ))
+                    parsed = normalized
+                    parsed, rejected, corrected, median_h = self._validate_bbox_lines(
+                        parsed,
+                        img_rgb.shape,
+                    )
+                    if isinstance(bbox_sanity, dict):
+                        bbox_sanity.setdefault("rejected_bbox_lines", []).extend(rejected)
+                        bbox_sanity.setdefault("corrected_bbox_lines", []).extend(corrected)
+                        bbox_sanity["median_line_height"] = round(median_h, 4)
+                    if rejected or corrected:
+                        logger.debug(
+                            "[PaddleOCR F2] Bbox validation variant=%s engine=%s rejected=%d corrected=%d median_h=%.1f",
+                            variant_name,
+                            engine_name,
+                            len(rejected),
+                            len(corrected),
+                            median_h,
+                        )
                     all_passes.append((variant_name, engine_name, parsed))
                 except Exception as exc:
                     logger.warning(
@@ -798,6 +947,31 @@ class PaddleOCRv5Model(BaseOCRModel):
         return diacritics / len(text)
 
     @staticmethod
+    def _arabic_base_letters(text: str) -> list[str]:
+        return [
+            c for c in text
+            if (
+                ("\u0600" <= c <= "\u06FF" and not ("\u064B" <= c <= "\u0652") and c != "\u0640")
+                or "\u0750" <= c <= "\u077F"
+                or "\uFB50" <= c <= "\uFDFF"
+                or "\uFE70" <= c <= "\uFEFF"
+            )
+        ]
+
+    @classmethod
+    def _arabic_noise_line_reason(cls, text: str, confidence: float) -> str | None:
+        """
+        Flag only lines that are both low-confidence and independently noisy.
+        Low-confidence meaningful Arabic is kept for postprocess review.
+        """
+        if not (text or "").strip() or confidence >= 0.60:
+            return None
+        noise = line_noise_score(text)
+        if float(noise["score"]) >= 0.65:
+            return "low_confidence_high_noise_score"
+        return None
+
+    @staticmethod
     def _median_box_height(parsed: list[tuple[str, float, list[int]]]) -> float:
         """
         Compute median bounding-box height from a parsed page.
@@ -806,7 +980,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         """
         if len(parsed) < 3:
             return float(_ARABIC_LINE_BAND_TOL_PX)
-        heights = [float(bbox[3] - bbox[1]) for _, _, bbox in parsed if bbox[3] > bbox[1]]
+        heights = [float(item[2][3] - item[2][1]) for item in parsed if item[2][3] > item[2][1]]
         if not heights:
             return float(_ARABIC_LINE_BAND_TOL_PX)
         return statistics.median(heights)
@@ -966,58 +1140,40 @@ class PaddleOCRv5Model(BaseOCRModel):
         if not parsed:
             return 0.0
 
-        total_text = " ".join(t.strip() for t, _, _ in parsed if t.strip())
+        total_text = " ".join(str(item[0]).strip() for item in parsed if str(item[0]).strip())
         if not total_text:
             return 0.0
 
-        mean_conf = sum(c for _, c, _ in parsed) / len(parsed)
+        mean_conf = sum(float(item[1]) for item in parsed) / len(parsed)
 
         if language == SupportedLanguage.ARABIC:
-            # Use word-token count × proxy chars/token instead of raw char len.
-            token_count = self._count_arabic_word_tokens(total_text)
-            content_len = max(1.0, float(token_count) * 4.5)
-            score = math.sqrt(content_len) * mean_conf
-
-            # Diacritic density guard.
-            ddensity = self._diacritic_density(total_text)
-            if ddensity > 0.40:
-                score *= 0.3
-                logger.debug("[PaddleOCR F2] Diacritic-dense pass penalised (density=%.2f): %s", ddensity, variant_name)
-
-            # Bbox height density check.
-            med_h = self._median_box_height(parsed)
-            if med_h < self.MIN_BOX_HEIGHT * 2:
-                score *= 0.4
-                logger.debug("[PaddleOCR F2] Low median box height (%.1f px) penalised: %s", med_h, variant_name)
-
-            # Arabic ratio gating — mixed-page aware.
-            ar_ratio = self._arabic_char_ratio(total_text)
-            non_ar_ratio = 1.0 - ar_ratio
-            is_mixed_page = non_ar_ratio > self.arabic_mixed_page_ratio_threshold
-            if is_mixed_page:
-                # Looser gate for legitimate Arabic + Latin/numeric mixed content.
-                if ar_ratio < 0.10:
-                    score *= 0.2
-            else:
-                if ar_ratio < 0.30:
-                    score *= 0.2
-                elif ar_ratio < 0.50:
-                    score *= 0.5
+            score_details = score_ocr_words([
+                {
+                    "text": text,
+                    "confidence": conf,
+                    "bbox": bbox,
+                    "line_level": True,
+                }
+                for text, conf, bbox, *_meta in parsed
+            ])
+            score = float(score_details["score"])
+            logger.debug(
+                "[PaddleOCR F2] Arabic score details for %s: %s",
+                variant_name,
+                score_details,
+            )
         else:
             total_len = len(total_text)
             score = math.sqrt(max(1.0, float(total_len))) * mean_conf
 
-        # Upscale penalty — applies to all languages.
-        if variant_name == "upscaled_2x":
-            score *= 0.88
+        if language != SupportedLanguage.ARABIC:
+            # Upscale penalty — applies to the legacy non-Arabic variants.
+            if variant_name == "upscaled_2x":
+                score *= 0.88
 
-        # Downscale variant is also slightly penalised vs the original.
-        if variant_name == "downscaled_0.75x":
-            score *= 0.93
-
-        # Noise guard — repeated characters.
-        if _RE_REPEATED.search(total_text):
-            score *= 0.5
+            # Noise guard — repeated characters.
+            if _RE_REPEATED.search(total_text):
+                score *= 0.5
 
         return score
 
@@ -1067,9 +1223,9 @@ class PaddleOCRv5Model(BaseOCRModel):
             return True, ["empty_primary_result"]
 
         line_count  = len(parsed)
-        total_text  = " ".join(t.strip() for t, _, _ in parsed if t.strip())
+        total_text  = " ".join(str(item[0]).strip() for item in parsed if str(item[0]).strip())
         total_chars = len(total_text)
-        avg_conf    = sum(c for _, c, _ in parsed) / line_count if line_count else 0.0
+        avg_conf    = sum(float(item[1]) for item in parsed) / line_count if line_count else 0.0
         ar_ratio    = self._arabic_char_ratio(total_text) if total_text else 0.0
 
         # --- 1. Coverage checks ---
@@ -1216,6 +1372,364 @@ class PaddleOCRv5Model(BaseOCRModel):
 
         return text.strip()
 
+    @staticmethod
+    def _bbox_iou(a: list[int], b: list[int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = float((ix2 - ix1) * (iy2 - iy1))
+        area_a = max(1.0, float((ax2 - ax1) * (ay2 - ay1)))
+        area_b = max(1.0, float((bx2 - bx1) * (by2 - by1)))
+        return inter / (area_a + area_b - inter)
+
+    @staticmethod
+    def _bbox_y_overlap_ratio(a: list[int], b: list[int]) -> float:
+        ay1, ay2 = float(a[1]), float(a[3])
+        by1, by2 = float(b[1]), float(b[3])
+        inter = max(0.0, min(ay2, by2) - max(ay1, by1))
+        denom = max(1.0, min(ay2 - ay1, by2 - by1))
+        return inter / denom
+
+    @staticmethod
+    def _line_text_similarity(a: str, b: str) -> float:
+        def _norm(text: str) -> str:
+            return re.sub(r"\s+", "", text or "")
+
+        return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+    @staticmethod
+    def _clamp_bbox_to_image(bbox: list[int], img_shape: tuple[int, ...]) -> list[int]:
+        h, w = img_shape[:2]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        x1 = max(0, min(x1, max(0, w - 1)))
+        y1 = max(0, min(y1, max(0, h - 1)))
+        x2 = max(x1 + 1, min(int(x2), w))
+        y2 = max(y1 + 1, min(int(y2), h))
+        return [x1, y1, x2, y2]
+
+    def _line_with_bbox_source(
+        self,
+        text: str,
+        conf: float,
+        bbox: list[int],
+        *,
+        variant_name: str,
+        scale: float,
+        effective_scale: float,
+        original_bbox_before_rescale: list[int],
+        img_shape: tuple[int, ...],
+        engine_name: str | None = None,
+    ) -> tuple[str, float, list[int], dict]:
+        normalized = self._clamp_bbox_to_image(bbox, img_shape)
+        meta = {
+            "variant_name": variant_name,
+            "scale": float(scale),
+            "effective_scale": float(effective_scale),
+            "original_bbox_before_rescale": [
+                int(round(float(v))) for v in original_bbox_before_rescale
+            ],
+            "bbox_after_rescale": normalized,
+            "engine_name": engine_name,
+        }
+        return (text, conf, normalized, meta)
+
+    def _validate_bbox_lines(
+        self,
+        parsed: list[tuple],
+        img_shape: tuple[int, ...],
+    ) -> tuple[list[tuple], list[dict], list[dict], float]:
+        if not parsed:
+            return [], [], [], 0.0
+
+        h, w = img_shape[:2]
+        clamped: list[tuple] = []
+        corrected: list[dict] = []
+        for item in parsed:
+            text, conf, bbox = item[:3]
+            meta = dict(item[3]) if len(item) > 3 and isinstance(item[3], dict) else {}
+            new_bbox = self._clamp_bbox_to_image(bbox, img_shape)
+            if list(bbox) != new_bbox:
+                corrected.append({
+                    "text": text,
+                    "confidence": round(float(conf), 4),
+                    "old_bbox": list(bbox),
+                    "new_bbox": new_bbox,
+                    "reason": "clamped_to_image_bounds",
+                    "bbox_source": meta,
+                })
+            meta["bbox_after_validation_clamp"] = new_bbox
+            clamped.append((text, conf, new_bbox, meta))
+
+        heights = [
+            float(item[2][3] - item[2][1])
+            for item in clamped
+            if item[2][2] > item[2][0] and item[2][3] > item[2][1]
+        ]
+        median_h = statistics.median(heights) if heights else float(self.MIN_BOX_HEIGHT)
+
+        valid: list[tuple] = []
+        rejected: list[dict] = []
+        for item in clamped:
+            text, conf, bbox, meta = item
+            bw = bbox[2] - bbox[0]
+            bh = bbox[3] - bbox[1]
+            reasons: list[str] = []
+            if bbox[0] < 0 or bbox[1] < 0 or bbox[2] > w or bbox[3] > h:
+                reasons.append("outside_image_bounds")
+            if bw <= 10:
+                reasons.append("width<=10")
+            if bh <= 8:
+                reasons.append("height<=8")
+            if median_h > 0 and bh > 3.0 * median_h:
+                reasons.append("height>3x_median")
+            if bw > 1.2 * w:
+                reasons.append("width>1.2x_page_width")
+
+            if reasons:
+                rejected.append({
+                    "text": text,
+                    "confidence": round(float(conf), 4),
+                    "bbox": bbox,
+                    "reasons": reasons,
+                    "bbox_source": meta,
+                })
+                if float(conf) >= 0.85:
+                    meta["bbox_validated"] = False
+                    meta["bbox_reject_reasons"] = reasons
+                    valid.append((text, conf, bbox, meta))
+                continue
+            meta["bbox_validated"] = True
+            valid.append((text, conf, bbox, meta))
+
+        return valid, rejected, corrected, float(median_h)
+
+    def _resolve_bbox_disagreements(
+        self,
+        selected: list[tuple],
+        all_passes: list[tuple[str, str, list[tuple]]],
+        img_shape: tuple[int, ...],
+        confidence_close_margin: float = 0.05,
+    ) -> tuple[list[tuple], list[dict]]:
+        if not selected:
+            return selected, []
+
+        all_lines = [
+            line
+            for _variant_name, _engine_name, parsed in all_passes
+            for line in parsed
+            if len(line) >= 4 and line[2]
+        ]
+        corrected: list[dict] = []
+        resolved: list[tuple] = []
+
+        for line in selected:
+            text, conf, bbox = line[:3]
+            meta = dict(line[3]) if len(line) > 3 and isinstance(line[3], dict) else {}
+            matches = [
+                other for other in all_lines
+                if self._bbox_y_overlap_ratio(bbox, other[2]) >= 0.35
+                and self._line_text_similarity(text, other[0]) >= 0.72
+            ]
+            if len(matches) <= 1:
+                resolved.append((text, conf, bbox, meta))
+                continue
+
+            original_candidates = [
+                other for other in matches
+                if isinstance(other[3], dict)
+                and other[3].get("variant_name") == "original"
+                and float(other[1]) >= float(conf) - confidence_close_margin
+            ]
+            if original_candidates:
+                chosen = max(original_candidates, key=lambda item: float(item[1]))
+                reason = "original_variant_confidence_close"
+            else:
+                ordered = sorted(matches, key=lambda item: (item[2][1] + item[2][3]) / 2.0)
+                chosen = ordered[len(ordered) // 2]
+                reason = "median_y_center_across_variants"
+
+            chosen_bbox = self._clamp_bbox_to_image(chosen[2], img_shape)
+            chosen_meta = dict(chosen[3]) if len(chosen) > 3 and isinstance(chosen[3], dict) else {}
+            if chosen_bbox != bbox:
+                corrected.append({
+                    "text": text,
+                    "confidence": round(float(conf), 4),
+                    "old_bbox": bbox,
+                    "new_bbox": chosen_bbox,
+                    "reason": reason,
+                    "matched_variant_count": len(matches),
+                    "bbox_source": chosen_meta,
+                })
+            merged_meta = dict(meta)
+            merged_meta["bbox_resolution"] = {
+                "reason": reason,
+                "matched_variant_count": len(matches),
+                "chosen_source": chosen_meta,
+            }
+            resolved.append((text, conf, chosen_bbox, merged_meta))
+
+        return resolved, corrected
+
+    @staticmethod
+    def _padded_bbox(
+        bbox: list[int],
+        img_shape: tuple[int, ...],
+        pad_ratio: float = 0.45,
+    ) -> list[int]:
+        h, w = img_shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        pad_x = max(8, int(bw * 0.10))
+        pad_y = max(8, int(bh * pad_ratio))
+        return [
+            max(0, x1 - pad_x),
+            max(0, y1 - pad_y),
+            min(w, x2 + pad_x),
+            min(h, y2 + pad_y),
+        ]
+
+    def _ocr_region(
+        self,
+        engine: object,
+        img_rgb: np.ndarray,
+        crop_bbox: list[int],
+        upscale: float = 1.8,
+    ) -> list[tuple[str, float, list[int]]]:
+        x1, y1, x2, y2 = crop_bbox
+        crop = img_rgb[y1:y2, x1:x2]
+        if crop.size == 0:
+            return []
+        scaled = cv2.resize(
+            crop,
+            (max(1, int(crop.shape[1] * upscale)), max(1, int(crop.shape[0] * upscale))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        result = engine.ocr(scaled)  # type: ignore[attr-defined]
+        parsed = self._parse_ocr_page(result[0]) if result and result[0] else []
+        if not parsed:
+            return []
+        inv = 1.0 / upscale
+        return [
+            (
+                text,
+                conf,
+                [
+                    int(bbox[0] * inv) + x1,
+                    int(bbox[1] * inv) + y1,
+                    int(bbox[2] * inv) + x1,
+                    int(bbox[3] * inv) + y1,
+                ],
+            )
+            for text, conf, bbox in parsed
+        ]
+
+    def _recover_top_band_lines(
+        self,
+        img_rgb: np.ndarray,
+        parsed: list[tuple[str, float, list[int]]],
+        engine: object,
+        trigger_ratio: float = 0.15,
+        band_ratio: float = 0.22,
+    ) -> tuple[list[tuple[str, float, list[int]]], dict]:
+        stats = {"attempted": False, "added": 0, "reason": ""}
+        if not parsed:
+            stats["reason"] = "no_existing_lines"
+            return parsed, stats
+        h, w = img_rgb.shape[:2]
+        first_top = min(item[2][1] for item in parsed)
+        if first_top <= h * trigger_ratio:
+            stats["reason"] = "first_line_near_top"
+            return parsed, stats
+
+        stats["attempted"] = True
+        band_h = max(32, int(h * band_ratio))
+        try:
+            recovered = self._ocr_region(engine, img_rgb, [0, 0, w, band_h], upscale=1.6)
+        except Exception as exc:
+            stats["reason"] = f"ocr_failed:{exc}"
+            return parsed, stats
+
+        additions: list[tuple[str, float, list[int]]] = []
+        for text, conf, bbox in recovered:
+            if not text.strip() or conf < 0.30:
+                continue
+            if bbox[1] >= first_top:
+                continue
+            if any(self._bbox_iou(bbox, old_item[2]) > 0.25 for old_item in parsed):
+                continue
+            additions.append(self._line_with_bbox_source(
+                text,
+                conf,
+                bbox,
+                variant_name="top_band_recovery",
+                scale=1.0,
+                effective_scale=1.0,
+                original_bbox_before_rescale=bbox,
+                img_shape=img_rgb.shape,
+                engine_name="region_ocr",
+            ))
+
+        stats["added"] = len(additions)
+        stats["reason"] = "ok" if additions else "no_new_top_lines"
+        return additions + parsed, stats
+
+    def _refine_low_confidence_regions(
+        self,
+        img_rgb: np.ndarray,
+        parsed: list[tuple[str, float, list[int]]],
+        engine: object,
+        confidence_threshold: float = 0.80,
+        replace_margin: float = 0.03,
+        max_regions: int = 12,
+    ) -> tuple[list[tuple[str, float, list[int]]], dict]:
+        stats = {"attempted": 0, "replaced": 0, "failed": 0}
+        if not parsed:
+            return parsed, stats
+
+        refined = list(parsed)
+        candidates = [
+            (idx, item)
+            for idx, item in enumerate(refined)
+            if item[1] < confidence_threshold and item[2][2] > item[2][0] and item[2][3] > item[2][1]
+        ][:max_regions]
+
+        for idx, old_item in candidates:
+            old_text, old_conf, old_bbox = old_item[:3]
+            crop_bbox = self._padded_bbox(old_bbox, img_rgb.shape)
+            stats["attempted"] += 1
+            try:
+                crop_lines = self._ocr_region(engine, img_rgb, crop_bbox, upscale=1.8)
+            except Exception:
+                stats["failed"] += 1
+                continue
+            if not crop_lines:
+                continue
+            best = max(
+                crop_lines,
+                key=lambda item: (self._bbox_iou(item[2], old_bbox), item[1]),
+            )
+            new_text, new_conf, new_bbox = best[:3]
+            if not new_text.strip():
+                continue
+            if new_conf <= old_conf + replace_margin:
+                continue
+            if self._arabic_char_ratio(new_text) < max(0.10, self._arabic_char_ratio(old_text) * 0.70):
+                continue
+            old_meta = dict(old_item[3]) if len(old_item) > 3 and isinstance(old_item[3], dict) else {}
+            old_meta["bbox_refinement"] = {
+                "old_text": old_text,
+                "old_confidence": round(float(old_conf), 4),
+                "old_bbox": old_bbox,
+            }
+            refined[idx] = (new_text, new_conf, new_bbox, old_meta)
+            stats["replaced"] += 1
+
+        return refined, stats
+
     # ------------------------------------------------------------------
     # Debug visualisation
     # ------------------------------------------------------------------
@@ -1303,7 +1817,7 @@ class PaddleOCRv5Model(BaseOCRModel):
 
         # Stage 4: final result overlay
         vis = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-        for text_raw, text_corrected, conf, (x1, y1, x2, y2) in results:
+        for text_raw, text_corrected, conf, (x1, y1, x2, y2), *_rest in results:
             cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
             label = f"[{conf:.2f}] {text_corrected[:40]}"
             vis = self._pil_draw_arabic(vis, label, (x1, max(y1 - 22, 2)), font_size=15)
@@ -1348,14 +1862,37 @@ class PaddleOCRv5Model(BaseOCRModel):
             "primary_response_corrected_text": "",
             "alt_response_raw_text": "",
             "alt_response_corrected_text": "",
+            "variant_scores": [],
+            "confidence_score": 0.0,
+            "rejected_bbox_lines": [],
+            "corrected_bbox_lines": [],
+        }
+        self._bbox_sanity_current = {
+            "rejected_bbox_lines": diagnostics["rejected_bbox_lines"],
+            "corrected_bbox_lines": diagnostics["corrected_bbox_lines"],
+            "median_line_height": 0.0,
         }
 
         # Stage 1+2 (primary): generate variants, run primary engine only
-        primary_passes = self._run_all_passes(
-            img_rgb, lang_enum, include_primary=True, include_alt=False
-        )
-        if not primary_passes:
-            return [], {}, diagnostics
+        try:
+            primary_passes = self._run_all_passes(
+                img_rgb, lang_enum, include_primary=True, include_alt=False
+            )
+            if not primary_passes:
+                return [], {}, diagnostics
+        finally:
+            bbox_sanity = getattr(self, "_bbox_sanity_current", None)
+            if isinstance(bbox_sanity, dict):
+                diagnostics["bbox_median_line_height"] = bbox_sanity.get("median_line_height", 0.0)
+        diagnostics["variant_scores"].extend([
+            {
+                "variant": variant_name,
+                "engine": engine_name,
+                "score": round(self._score_pass(parsed, lang_enum, variant_name), 4),
+                "item_count": len(parsed),
+            }
+            for variant_name, engine_name, parsed in primary_passes
+        ])
 
         # Stage 3: pick the best complete primary pass
         best_variant, best_engine, best_parsed, best_score = self._select_best_pass(
@@ -1363,18 +1900,30 @@ class PaddleOCRv5Model(BaseOCRModel):
         )
         diagnostics["primary_best_score"] = round(best_score, 3)
 
+        if lang_enum == SupportedLanguage.ARABIC:
+            primary_engine = self._get_or_load_primary_engine(lang_enum)
+            if primary_engine is not None:
+                best_parsed, top_recovery_stats = self._recover_top_band_lines(
+                    img_rgb, best_parsed, primary_engine
+                )
+                best_parsed, roi_refine_stats = self._refine_low_confidence_regions(
+                    img_rgb, best_parsed, primary_engine
+                )
+                diagnostics["top_band_recovery"] = top_recovery_stats
+                diagnostics["roi_upscale_refinement"] = roi_refine_stats
+
         primary_sorted = self._sort_lines_reading_order(best_parsed, lang_enum)
         diagnostics["primary_response_raw_text"] = "\n".join(
-            t for t, _, _ in primary_sorted if t and t.strip()
+            str(item[0]) for item in primary_sorted if item[0] and str(item[0]).strip()
         )
         diagnostics["primary_response_corrected_text"] = "\n".join(
             (
-                self._arabic_correct(t)
+                self._arabic_correct(str(item[0]))
                 if lang_enum == SupportedLanguage.ARABIC
-                else t
+                else str(item[0])
             )
-            for t, _, _ in primary_sorted
-            if t and t.strip()
+            for item in primary_sorted
+            if item[0] and str(item[0]).strip()
         )
 
         all_pass_count = len(primary_passes)
@@ -1412,16 +1961,27 @@ class PaddleOCRv5Model(BaseOCRModel):
                 )
                 all_pass_count += len(alt_passes)
                 if alt_passes:
+                    diagnostics["variant_scores"].extend([
+                        {
+                            "variant": variant_name,
+                            "engine": engine_name,
+                            "score": round(self._score_pass(parsed, lang_enum, variant_name), 4),
+                            "item_count": len(parsed),
+                        }
+                        for variant_name, engine_name, parsed in alt_passes
+                    ])
                     alt_variant, alt_engine, alt_parsed, alt_score = self._select_best_pass(
                         alt_passes, lang_enum
                     )
                     diagnostics["alt_best_score"] = round(alt_score, 3)
                     alt_sorted = self._sort_lines_reading_order(alt_parsed, lang_enum)
                     diagnostics["alt_response_raw_text"] = "\n".join(
-                        t for t, _, _ in alt_sorted if t and t.strip()
+                        str(item[0]) for item in alt_sorted if item[0] and str(item[0]).strip()
                     )
                     diagnostics["alt_response_corrected_text"] = "\n".join(
-                        self._arabic_correct(t) for t, _, _ in alt_sorted if t and t.strip()
+                        self._arabic_correct(str(item[0]))
+                        for item in alt_sorted
+                        if item[0] and str(item[0]).strip()
                     )
                     if alt_score > best_score * (1.0 + self.fallback_replace_margin):
                         logger.info(
@@ -1440,18 +2000,35 @@ class PaddleOCRv5Model(BaseOCRModel):
                             best_variant, best_engine, alt_score
                         )
 
+        all_candidate_passes = list(primary_passes)
+        if lang_enum == SupportedLanguage.ARABIC and diagnostics.get("alt_response_raw_text"):
+            # alt_passes is only defined in the branch above; collect it when present.
+            try:
+                all_candidate_passes.extend(alt_passes)  # type: ignore[name-defined]
+            except NameError:
+                pass
+
+        if lang_enum == SupportedLanguage.ARABIC:
+            best_parsed, bbox_resolution_corrections = self._resolve_bbox_disagreements(
+                best_parsed,
+                all_candidate_passes,
+                img_rgb.shape,
+            )
+            diagnostics["corrected_bbox_lines"].extend(bbox_resolution_corrections)
+
         # Stage 4+5: apply Arabic correction to the winning pass
         results: list[tuple[str, str, float, list[int]]] = []
-        for text_raw, conf, bbox in best_parsed:
+        for text_raw, conf, bbox, *rest in best_parsed:
             if not text_raw or not text_raw.strip():
                 continue
+            bbox_meta = rest[0] if rest and isinstance(rest[0], dict) else {}
             text_corrected = (
                 self._arabic_correct(text_raw)
                 if lang_enum == SupportedLanguage.ARABIC
                 else text_raw
             )
             if text_corrected:
-                results.append((text_raw, text_corrected, conf, bbox))
+                results.append((text_raw, text_corrected, conf, bbox, bbox_meta))
 
         results = self._sort_f2_results_reading_order(results, lang_enum)
 
@@ -1461,6 +2038,7 @@ class PaddleOCRv5Model(BaseOCRModel):
         )
         diagnostics["selected_variant"] = best_variant
         diagnostics["selected_engine"] = best_engine
+        diagnostics["confidence_score"] = round(best_score, 4)
         logger.info(
             "[PaddleOCR F2] Selected response source: engine=%s variant=%s mode=%s primary_score=%s alt_score=%s",
             diagnostics["selected_engine"],
@@ -1478,6 +2056,9 @@ class PaddleOCRv5Model(BaseOCRModel):
                 debug_paths = self._visualize_f2(img_rgb, variants, results, debug_run_id)
             except Exception as exc:
                 logger.warning("[PaddleOCR F2 VIS] Visualisation failed: %s", exc)
+
+        if hasattr(self, "_bbox_sanity_current"):
+            delattr(self, "_bbox_sanity_current")
 
         return results, debug_paths, diagnostics
 
@@ -1563,7 +2144,7 @@ class PaddleOCRv5Model(BaseOCRModel):
 
     @staticmethod
     def _page_score(parsed_page: list[tuple[str, float, list[int]]]) -> float:
-        return sum(conf for _, conf, _ in parsed_page) if parsed_page else 0.0
+        return sum(float(item[1]) for item in parsed_page) if parsed_page else 0.0
 
     def _select_all_language_page(
         self, img_array: np.ndarray
@@ -1583,16 +2164,25 @@ class PaddleOCRv5Model(BaseOCRModel):
             result = engine.ocr(capped_img)
             total_elapsed += self._elapsed_ms(t0)
             parsed = self._parse_ocr_page(result[0]) if result and result[0] else []
-            # Scale bboxes back to original image coordinates.
-            if cap_scale != 1.0 and parsed:
-                inv = 1.0 / cap_scale
-                parsed = [
-                    (text, conf, [
-                        int(bbox[0] * inv), int(bbox[1] * inv),
-                        int(bbox[2] * inv), int(bbox[3] * inv),
-                    ])
-                    for text, conf, bbox in parsed
-                ]
+            inv = 1.0 / cap_scale if cap_scale else 1.0
+            parsed = [
+                self._line_with_bbox_source(
+                    text,
+                    conf,
+                    [bbox[0] * inv, bbox[1] * inv, bbox[2] * inv, bbox[3] * inv],
+                    variant_name="pre_resized" if cap_scale != 1.0 else "original",
+                    scale=cap_scale,
+                    effective_scale=cap_scale,
+                    original_bbox_before_rescale=bbox,
+                    img_shape=img_array.shape,
+                    engine_name=LANG_CONFIG[lang_enum]["ocr_version"],
+                )
+                for text, conf, bbox in parsed
+            ]
+            parsed, _rejected, _corrected, _median_h = self._validate_bbox_lines(
+                parsed,
+                img_array.shape,
+            )
             score = self._page_score(parsed)
             if score > best_score:
                 best_score, best_lang, best_page = score, lang_enum, parsed
@@ -1627,21 +2217,88 @@ class PaddleOCRv5Model(BaseOCRModel):
             all_debug: dict[str, str] = {}
             f2_page_diagnostics: list[dict] = []
             input_pipeline_pages: list[dict] = []
+            structured_pages: list[dict] = []
+            rejected_bbox_lines: list[dict] = []
+            corrected_bbox_lines: list[dict] = []
 
             for page_idx, image in enumerate(pages):
                 img_array = np.array(image)
-                img_array, prep_meta = self._apply_document_roi_warp(img_array)
+                img_array, prep_meta = self._apply_document_roi_warp(img_array, language)
                 input_pipeline_pages.append(prep_meta)
+                page_lines: list[dict] = []
+                page_flagged_lines: list[dict] = []
+                page_raw_lines: list[str] = []
+
+                def append_page_line(
+                    text: str,
+                    raw_text: str,
+                    conf: float,
+                    flat_bbox: list[int],
+                    line_language: SupportedLanguage | None,
+                    bbox_source: dict | None = None,
+                    bbox_valid: bool = True,
+                ) -> None:
+                    page_raw_lines.append(raw_text)
+                    line_index = len(page_raw_lines) - 1
+                    line_meta = {
+                        "page_index": page_idx,
+                        "line_index": line_index,
+                        "text": text,
+                        "raw_text": raw_text,
+                        "confidence": round(float(conf), 4),
+                        "bbox": flat_bbox,
+                        "line_level": True,
+                        "bbox_source": bbox_source or {},
+                        "bbox_valid": bbox_valid,
+                    }
+                    if not bbox_valid:
+                        line_meta["status"] = "review_line"
+                        line_meta["review_reason"] = "invalid_bbox"
+                    noise_reason = (
+                        self._arabic_noise_line_reason(text, conf)
+                        if line_language == SupportedLanguage.ARABIC
+                        else None
+                    )
+                    if noise_reason:
+                        line_meta["filter_reason"] = noise_reason
+                        page_flagged_lines.append(line_meta.copy())
+                    token_items = split_line_tokens(
+                        text,
+                        conf,
+                        flat_bbox,
+                        synthetic_line_tokens=True,
+                    )
+                    line_meta["words"] = [
+                        {
+                            "text": token.get("text", ""),
+                            "confidence": round(float(token.get("confidence", 0.0)), 4),
+                            "bbox": token.get("bbox"),
+                        }
+                        for token in token_items
+                    ]
+                    for token in token_items or [{
+                        "text": text,
+                        "confidence": conf,
+                        "bbox": flat_bbox,
+                    }]:
+                        words.append(OCRWord(
+                            text=str(token.get("text", "")),
+                            confidence=float(token.get("confidence", conf)),
+                            bbox=token.get("bbox"),
+                        ))
+                    lines.append(text)
+                    lines_raw.append(raw_text)
+                    page_lines.append(line_meta)
 
                 if language == SupportedLanguage.ALL:
                     page_lang, parsed_std, page_elapsed = self._select_all_language_page(img_array)
                     total_elapsed += page_elapsed
                     resolved_page_languages.append(page_lang.value if page_lang else None)
                     lines, lines_raw = [], []
-                    for text, conf, flat_bbox in parsed_std:
-                        words.append(OCRWord(text=text, confidence=conf, bbox=flat_bbox))
-                        lines.append(text)
-                        lines_raw.append(text)
+                    for text, conf, flat_bbox, *rest in parsed_std:
+                        bbox_source = rest[0] if rest and isinstance(rest[0], dict) else {}
+                        bbox_valid = bbox_source.get("bbox_validated", True) is not False
+                        append_page_line(text, text, conf, flat_bbox, page_lang, bbox_source, bbox_valid)
 
                 elif f2_active:
                     t0 = self._timer()
@@ -1652,11 +2309,19 @@ class PaddleOCRv5Model(BaseOCRModel):
                     total_elapsed += self._elapsed_ms(t0)
                     all_debug.update({f"p{page_idx}_{k}": v for k, v in debug_paths.items()})
                     f2_page_diagnostics.append(diag)
+                    for item in diag.get("rejected_bbox_lines", []) or []:
+                        rejected_item = dict(item)
+                        rejected_item["page_index"] = page_idx
+                        rejected_bbox_lines.append(rejected_item)
+                    for item in diag.get("corrected_bbox_lines", []) or []:
+                        corrected_item = dict(item)
+                        corrected_item["page_index"] = page_idx
+                        corrected_bbox_lines.append(corrected_item)
                     lines, lines_raw = [], []
-                    for text_raw, text_corrected, conf, flat_bbox in f2_page:
-                        words.append(OCRWord(text=text_corrected, confidence=conf, bbox=flat_bbox))
-                        lines.append(text_corrected)
-                        lines_raw.append(text_raw)
+                    for text_raw, text_corrected, conf, flat_bbox, *rest in f2_page:
+                        bbox_source = rest[0] if rest and isinstance(rest[0], dict) else {}
+                        bbox_valid = bbox_source.get("bbox_validated", True) is not False
+                        append_page_line(text_corrected, text_raw, conf, flat_bbox, language, bbox_source, bbox_valid)
 
                 else:
                     # Pre-resize so PaddleX's internal max_side_limit (4000 px)
@@ -1666,34 +2331,216 @@ class PaddleOCRv5Model(BaseOCRModel):
                     result = engine.ocr(capped_img)  # type: ignore[union-attr]
                     total_elapsed += self._elapsed_ms(t0)
                     parsed_std = self._parse_ocr_page(result[0]) if result and result[0] else []
-                    # Scale bboxes back to original image coordinates.
-                    if cap_scale != 1.0 and parsed_std:
-                        inv = 1.0 / cap_scale
-                        parsed_std = [
-                            (text, conf, [
-                                int(bbox[0] * inv), int(bbox[1] * inv),
-                                int(bbox[2] * inv), int(bbox[3] * inv),
-                            ])
-                            for text, conf, bbox in parsed_std
-                        ]
+                    inv = 1.0 / cap_scale if cap_scale else 1.0
+                    parsed_std = [
+                        self._line_with_bbox_source(
+                            text,
+                            conf,
+                            [bbox[0] * inv, bbox[1] * inv, bbox[2] * inv, bbox[3] * inv],
+                            variant_name="pre_resized" if cap_scale != 1.0 else "original",
+                            scale=cap_scale,
+                            effective_scale=cap_scale,
+                            original_bbox_before_rescale=bbox,
+                            img_shape=img_array.shape,
+                            engine_name=LANG_CONFIG[language]["ocr_version"],
+                        )
+                        for text, conf, bbox in parsed_std
+                    ]
+                    parsed_std, rejected_bbox, corrected_bbox, median_h = self._validate_bbox_lines(
+                        parsed_std,
+                        img_array.shape,
+                    )
+                    for item in rejected_bbox:
+                        rejected_item = dict(item)
+                        rejected_item["page_index"] = page_idx
+                        rejected_bbox_lines.append(rejected_item)
+                    for item in corrected_bbox:
+                        corrected_item = dict(item)
+                        corrected_item["page_index"] = page_idx
+                        corrected_bbox_lines.append(corrected_item)
                     lines, lines_raw = [], []
-                    for text, conf, flat_bbox in parsed_std:
-                        words.append(OCRWord(text=text, confidence=conf, bbox=flat_bbox))
-                        lines.append(text)
-                        lines_raw.append(text)
+                    for text, conf, flat_bbox, *rest in parsed_std:
+                        bbox_source = rest[0] if rest and isinstance(rest[0], dict) else {}
+                        bbox_valid = bbox_source.get("bbox_validated", True) is not False
+                        append_page_line(text, text, conf, flat_bbox, language, bbox_source, bbox_valid)
 
-                page_texts.append("\n".join(lines))
-                page_texts_raw.append("\n".join(lines_raw))
+                page_text = "\n".join(lines)
+                page_text_raw = "\n".join(page_raw_lines)
+                page_avg_conf = (
+                    sum(line["confidence"] for line in page_lines) / len(page_lines)
+                    if page_lines else 0.0
+                )
+                structured_pages.append({
+                    "page_index": page_idx,
+                    "text": page_text,
+                    "raw_text": page_text_raw,
+                    "lines": page_lines,
+                    "flagged_lines": page_flagged_lines,
+                    "filtered_lines": page_flagged_lines,
+                    "avg_confidence": round(page_avg_conf, 4),
+                })
+                page_texts.append(page_text)
+                page_texts_raw.append(page_text_raw)
                 self._maybe_empty_gpu_cache(page_idx)
+
+            postprocess_applied = False
+            postprocess_page_results: list[dict] = []
+            debug_lines: list[dict] = []
+            debug_blocks: list[dict] = []
+            review_lines: list[dict] = []
+            excluded_noise_lines: list[dict] = []
+            per_line_confidence: list[dict] = []
+            per_line_noise_score: list[dict] = []
+            confidence_scores: list[float] = []
+            selected_variants: list[str] = []
+            if language == SupportedLanguage.ARABIC:
+                page_texts = []
+                for page in structured_pages:
+                    original_page_text = page["text"]
+                    page_idx = int(page.get("page_index", 0))
+                    page_diag = (
+                        f2_page_diagnostics[page_idx]
+                        if f2_active and page_idx < len(f2_page_diagnostics)
+                        else {}
+                    )
+                    post_result = postprocess_ocr_result(
+                        page["lines"],
+                        raw_text=page.get("raw_text", original_page_text),
+                        selected_variant=page_diag.get("selected_variant") or "original",
+                        variant_scores=page_diag.get("variant_scores", []),
+                    )
+                    processed_page_text = post_result["text"]
+                    page["text_before_postprocess"] = original_page_text
+                    page["postprocessed_text"] = processed_page_text
+                    page["accepted_lines"] = post_result["accepted_lines"]
+                    page["review_lines"] = post_result["review_lines"]
+                    page["excluded_noise_lines"] = post_result["excluded_noise_lines"]
+                    page["excluded_lines"] = post_result["excluded_lines"]
+                    page["flagged_lines"] = post_result["flagged_lines"]
+                    page["filtered_lines"] = post_result["flagged_lines"]
+                    page["per_line_confidence"] = post_result["per_line_confidence"]
+                    page["per_line_noise_score"] = post_result["per_line_noise_score"]
+                    page["debug_lines"] = post_result["debug_lines"]
+                    page["debug_blocks"] = post_result["debug_blocks"]
+                    if processed_page_text:
+                        page["text"] = processed_page_text
+                        postprocess_applied = True
+                    for line in post_result.get("review_lines", []):
+                        review_line = dict(line)
+                        review_line["page_index"] = page_idx
+                        review_lines.append(review_line)
+                    for line in post_result.get("excluded_noise_lines", []):
+                        noise_line = dict(line)
+                        noise_line["page_index"] = page_idx
+                        excluded_noise_lines.append(noise_line)
+                    for item in post_result.get("per_line_confidence", []):
+                        conf_item = dict(item)
+                        conf_item["page_index"] = page_idx
+                        per_line_confidence.append(conf_item)
+                    for item in post_result.get("per_line_noise_score", []):
+                        noise_item = dict(item)
+                        noise_item["page_index"] = page_idx
+                        per_line_noise_score.append(noise_item)
+                    for line in post_result.get("debug_lines", []):
+                        debug_line = dict(line)
+                        debug_line["page_index"] = page_idx
+                        debug_lines.append(debug_line)
+                    for block in post_result.get("debug_blocks", []):
+                        debug_block = dict(block)
+                        debug_block["page_index"] = page_idx
+                        debug_blocks.append(debug_block)
+                    confidence_scores.append(float(post_result.get("confidence_score", 0.0)))
+                    if post_result.get("selected_variant"):
+                        selected_variants.append(str(post_result["selected_variant"]))
+                    postprocess_page_results.append(post_result)
+                    page_texts.append(page["text"])
 
             raw_text     = "\n\n".join(t for t in page_texts     if t)
             raw_text_pre = "\n\n".join(t for t in page_texts_raw if t)
             avg_conf     = sum(w.confidence for w in words) / len(words) if words else 0.0
+            line_count   = sum(len(page["lines"]) for page in structured_pages)
+            char_count   = len(raw_text.strip())
+            flagged_line_count = sum(
+                len(page.get("flagged_lines", [])) for page in structured_pages
+            )
+            excluded_line_count = sum(
+                len(page.get("excluded_lines", [])) for page in structured_pages
+            )
+            review_line_count = sum(
+                len(page.get("review_lines", [])) for page in structured_pages
+            )
+            excluded_noise_line_count = sum(
+                len(page.get("excluded_noise_lines", [])) for page in structured_pages
+            )
+            low_confidence_lines = sum(
+                1
+                for page in structured_pages
+                for line in page["lines"]
+                if line["confidence"] < 0.70
+            )
+            warnings: list[str] = []
+            if char_count == 0:
+                warnings.append("no_text_detected")
+            if words and avg_conf < 0.65:
+                warnings.append("low_average_confidence")
+            if flagged_line_count > 0:
+                warnings.append("arabic_noise_lines_flagged")
+            if excluded_line_count > 0:
+                warnings.append("excluded_high_noise_lines")
+            if review_line_count > 0:
+                warnings.append("low_confidence_review_lines_present")
+            if line_count <= 2 and char_count < 40:
+                warnings.append("low_text_coverage")
+            quality_status = (
+                "empty" if char_count == 0
+                else "review" if warnings
+                else "usable"
+            )
 
             metadata: dict = {
                 "page_count":                len(pages),
                 "max_accuracy_mode":         f2_active,
+                "final_text":                raw_text,
                 "raw_text_before_correction": raw_text_pre,
+                "selected_variant": (
+                    selected_variants[0]
+                    if selected_variants and len(set(selected_variants)) == 1
+                    else "multi_page" if selected_variants else None
+                ),
+                "selected_variants": selected_variants,
+                "confidence_score": round(
+                    sum(confidence_scores) / len(confidence_scores),
+                    4,
+                ) if confidence_scores else round(avg_conf, 4),
+                "debug_lines": debug_lines,
+                "debug_blocks": debug_blocks,
+                "rejected_bbox_lines": rejected_bbox_lines,
+                "corrected_bbox_lines": corrected_bbox_lines,
+                "review_lines": review_lines,
+                "excluded_noise_lines": excluded_noise_lines,
+                "per_line_confidence": per_line_confidence,
+                "per_line_noise_score": per_line_noise_score,
+                "pages":                     structured_pages,
+                "quality": {
+                    "status": quality_status,
+                    "warnings": warnings,
+                    "line_count": line_count,
+                    "char_count": char_count,
+                    "flagged_line_count": flagged_line_count,
+                    "filtered_line_count": flagged_line_count,
+                    "review_line_count": review_line_count,
+                    "excluded_noise_line_count": excluded_noise_line_count,
+                    "excluded_line_count": excluded_line_count,
+                    "low_confidence_line_count": low_confidence_lines,
+                    "avg_confidence": round(avg_conf, 4),
+                    "line_handling": "exclude_only_when_low_confidence_and_high_noise_score",
+                },
+                "postprocess": {
+                    "applied": postprocess_applied,
+                    "mode": "deterministic_arabic_bbox_dictionary",
+                    "preserves_raw_text": True,
+                    "pages": postprocess_page_results,
+                },
             }
             if all_debug:
                 metadata["debug_visualizations"] = all_debug

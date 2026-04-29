@@ -1,0 +1,32 @@
+# Small seed dictionary for deterministic OCR cleanup.
+# Extend this file with domain vocabulary from ground-truth documents.
+العاصمة
+المتقاعد
+العامة
+الجمهور
+المسرح
+المسارح
+الأولى
+الفنان
+الفنية
+مدرجات
+الصالة
+شكل
+غرفة
+حائط
+وسقف
+المساحة
+الأرض
+الاستقلال
+السياسية
+الكويت
+العراق
+الحدود
+وثائق
+خرائط
+اتفاقيات
+معروفة
+موثقة
+دوليا
+الحقائق
+العلمية

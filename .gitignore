@@ -54,3 +54,6 @@ htmlcov/
 tests/
 test_image
 README.md
+
+ocr_output
+tests

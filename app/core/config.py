@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # Cap detection input side length to control VRAM usage.
     # (Used by PaddleOCR det_limit_side_len / limit_side_len if supported.)
     PADDLE_DET_LIMIT_SIDE_LEN: int | None = None
+    PADDLE_TEXT_DET_THRESH: float = 0.22
+    PADDLE_TEXT_DET_BOX_THRESH: float = 0.35
+    PADDLE_TEXT_REC_SCORE_THRESH: float = 0.30
 
     # F2 pipeline debug visualisations
     PADDLE_DEBUG_OUTPUT_DIR: str = ""
@@ -46,6 +49,7 @@ class Settings(BaseSettings):
     PADDLE_F2_FALLBACK_REPLACE_MARGIN: float = 0.03
 
     PADDLE_INPUT_ROI_WARP: bool = False
+    PADDLE_ARABIC_AUTO_PAGE_CROP: bool = True
     PADDLE_ROI_MIN_AREA_RATIO: float = 0.15
     PADDLE_ROI_PAD_RATIO: float = 0.02
 
