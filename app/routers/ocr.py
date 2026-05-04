@@ -4,8 +4,8 @@
 
 import time
 import logging
-
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse, Response
 
 from app.schemas import (
     OCRResponse,
@@ -14,13 +14,20 @@ from app.schemas import (
     PageDetail,
     LineDetail,
     Language,
+    ModelInfo,
+    OCRRunOptionsResponse,
 )
 from app.models.base import SupportedLanguage
 from app.core.config import settings
+from app.core.model_registry import AVAILABLE_MODEL_NAMES
+from app.core.model_selection import preset_model_groups
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-PRIMARY_MODEL_NAME = "paddleocr_v5"
+PRIMARY_MODEL_NAME = "paddleocr_vl"
+QARI_MODEL_NAME = "qari_ocr_vl_2b"
+PADDLEOCR_VL_MODEL_NAME = "paddleocr_vl"
+LANGUAGE_OPTIONAL_MODEL_NAMES = {QARI_MODEL_NAME, PADDLEOCR_VL_MODEL_NAME}
 
 
 def get_registry(request: Request):
@@ -46,9 +53,6 @@ def _line_from_metadata(item: dict) -> LineDetail:
         bbox_source=item.get("bbox_source", {}) or {},
         bbox_valid=bool(item.get("bbox_valid", True)),
         status=item.get("status"),
-        noise_score=item.get("noise_score"),
-        filter_reason=item.get("filter_reason"),
-        exclude_reason=item.get("exclude_reason"),
     )
 
 
@@ -60,23 +64,6 @@ def _pages_from_metadata(metadata: dict) -> list[PageDetail]:
             _line_from_metadata(line)
             for line in page.get("accepted_lines", []) or []
         ]
-        review_lines = [
-            _line_from_metadata(line)
-            for line in page.get("review_lines", []) or []
-        ]
-        flagged_line_items = page.get("flagged_lines", page.get("filtered_lines", [])) or []
-        flagged_lines = [
-            _line_from_metadata(line)
-            for line in flagged_line_items
-        ]
-        excluded_noise_lines = [
-            _line_from_metadata(line)
-            for line in page.get("excluded_noise_lines", []) or []
-        ]
-        excluded_lines = [
-            _line_from_metadata(line)
-            for line in page.get("excluded_lines", []) or []
-        ]
         pages.append(
             PageDetail(
                 page_index=int(page.get("page_index", 0)),
@@ -84,13 +71,7 @@ def _pages_from_metadata(metadata: dict) -> list[PageDetail]:
                 raw_text=str(page.get("raw_text", page.get("text", ""))),
                 lines=lines,
                 accepted_lines=accepted_lines,
-                review_lines=review_lines,
-                flagged_lines=flagged_lines,
-                filtered_lines=flagged_lines,
-                excluded_noise_lines=excluded_noise_lines,
-                excluded_lines=excluded_lines,
                 per_line_confidence=page.get("per_line_confidence", []) or [],
-                per_line_noise_score=page.get("per_line_noise_score", []) or [],
                 layout_mode=str(page.get("layout_mode", "text")),
                 tables=page.get("tables", []) or [],
                 totals=page.get("totals", {}) or {},
@@ -107,20 +88,137 @@ def _flatten_page_lines(pages: list[PageDetail], attr: str) -> list[LineDetail]:
     return out
 
 
-@router.post("/run", response_model=OCRResponse, summary="Run OCR on an image")
+def _model_info(name: str, model, loaded: bool) -> ModelInfo:
+    return ModelInfo(
+        name=name,
+        tier=int(getattr(model, "tier", 0)) if model is not None else 0,
+        supported_languages=[lang.value for lang in getattr(model, "supported_languages", [])],
+        loaded=loaded,
+    )
+
+
+@router.get("/run/options", response_model=OCRRunOptionsResponse, summary="List OCR run options")
+async def run_options(registry=Depends(get_registry)):
+    loaded_models = [
+        _model_info(name, model, True)
+        for name, model in sorted(registry.all().items())
+    ]
+    return OCRRunOptionsResponse(
+        loaded_models=loaded_models,
+        available_model_names=AVAILABLE_MODEL_NAMES,
+        available_languages=list(Language),
+        preset_model_groups=preset_model_groups(),
+        language_required_by_model={
+            QARI_MODEL_NAME: False,
+            PADDLEOCR_VL_MODEL_NAME: False,
+        },
+    )
+
+
+async def _run_qari_raw_text(
+    selected_model,
+    image_bytes: bytes,
+    filename: str | None,
+):
+    logger.info(f"[OCR] Running {QARI_MODEL_NAME} | file={filename}")
+    try:
+        output_text = await selected_model.run_raw(image_bytes)
+    except Exception as exc:
+        logger.exception("[OCR] Qari raw inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return Response(content=output_text, media_type="text/plain; charset=utf-8")
+
+
+async def _run_paddleocr_vl_raw_json(
+    selected_model,
+    image_bytes: bytes,
+    filename: str | None,
+):
+    logger.info(f"[OCR] Running {PADDLEOCR_VL_MODEL_NAME} raw official response | file={filename}")
+    try:
+        output_json = await selected_model.run_raw_json(image_bytes)
+    except Exception as exc:
+        logger.exception("[OCR] PaddleOCR-VL raw inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return JSONResponse(content=output_json)
+
+
+@router.post("/run/qari", summary="Run Qari OCR on an image")
+async def run_qari_ocr(
+    request: Request,
+    file: UploadFile = File(..., description="Image file to process"),
+    registry=Depends(get_registry),
+):
+    """
+    Upload an image and run Qari OCR with no language parameter.
+    """
+    _validate_image(file)
+
+    image_bytes = await file.read()
+    if len(image_bytes) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File exceeds {settings.MAX_FILE_SIZE_MB}MB limit")
+
+    selected_model = registry.get(QARI_MODEL_NAME)
+    if selected_model is None:
+        failure_reason = getattr(registry, "failed_models", {}).get(QARI_MODEL_NAME)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Configured OCR model '{QARI_MODEL_NAME}' is not loaded at startup."
+                + (f" Startup error: {failure_reason}" if failure_reason else "")
+            ),
+        )
+
+    return await _run_qari_raw_text(selected_model, image_bytes, file.filename)
+
+
+@router.post("/run/paddleocr-vl", summary="Run PaddleOCR-VL and return the official PaddleOCR response")
+async def run_paddleocr_vl_raw(
+    request: Request,
+    file: UploadFile = File(..., description="Image or PDF file to process"),
+    registry=Depends(get_registry),
+):
+    """
+    Upload an image/PDF and return PaddleOCR-VL's native result.json response.
+    """
+    _validate_image(file)
+
+    image_bytes = await file.read()
+    if len(image_bytes) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File exceeds {settings.MAX_FILE_SIZE_MB}MB limit")
+
+    selected_model = registry.get(PADDLEOCR_VL_MODEL_NAME)
+    if selected_model is None:
+        failure_reason = getattr(registry, "failed_models", {}).get(PADDLEOCR_VL_MODEL_NAME)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Configured OCR model '{PADDLEOCR_VL_MODEL_NAME}' is not loaded at startup."
+                + (f" Startup error: {failure_reason}" if failure_reason else "")
+            ),
+        )
+
+    return await _run_paddleocr_vl_raw_json(selected_model, image_bytes, file.filename)
+
+
+@router.post("/run", summary="Run OCR on an image")
 async def run_ocr(
     request: Request,
     file: UploadFile = File(..., description="Image file to process"),
-    language: Language = Form(
-        ...,
+    language: Language | None = Form(
+        default=None,
         description=(
-            "Target language. Use 'all' to run best-effort multilingual OCR and extract all detectable text content."
+            "Target language. Not required for Qari OCR or PaddleOCR-VL."
         ),
+    ),
+    model: str = Form(
+        default=PRIMARY_MODEL_NAME,
+        description="OCR model to run. Options: qari_ocr_vl_2b, paddleocr_vl.",
     ),
     registry=Depends(get_registry),
 ):
     """
-    Upload an image and run the configured PaddleOCR model on it.
+    Upload an image and run the selected OCR model on it.
     Returns extracted text, word-level details, confidence, and timing.
     """
     _validate_image(file)
@@ -129,28 +227,48 @@ async def run_ocr(
     if len(image_bytes) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File exceeds {settings.MAX_FILE_SIZE_MB}MB limit")
 
-    lang_enum = SupportedLanguage(language.value)
-    model = registry.get(PRIMARY_MODEL_NAME)
-    if model is None:
+    model_name = (model or PRIMARY_MODEL_NAME).strip()
+    selected_model = registry.get(model_name)
+    if selected_model is None:
+        if model_name not in AVAILABLE_MODEL_NAMES:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown OCR model '{model_name}'. Available: {AVAILABLE_MODEL_NAMES}",
+            )
+        failure_reason = getattr(registry, "failed_models", {}).get(model_name)
         raise HTTPException(
             status_code=503,
-            detail=f"Configured OCR model '{PRIMARY_MODEL_NAME}' is not loaded at startup.",
+            detail=(
+                f"Configured OCR model '{model_name}' is not loaded at startup."
+                + (f" Startup error: {failure_reason}" if failure_reason else "")
+            ),
         )
-    if not model.supports_language(lang_enum):
+    lang_enum: SupportedLanguage | None = None
+    if model_name not in LANGUAGE_OPTIONAL_MODEL_NAMES:
+        if language is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"language is required when model='{model_name}'.",
+            )
+        lang_enum = SupportedLanguage(language.value)
+
+    if lang_enum is not None and not selected_model.supports_language(lang_enum):
         raise HTTPException(
             status_code=404,
-            detail=f"Configured OCR model '{PRIMARY_MODEL_NAME}' does not support language '{language.value}'.",
+            detail=f"Configured OCR model '{model_name}' does not support language '{lang_enum.value}'.",
         )
     
     start = time.perf_counter()
-    logger.info(f"[OCR] Running {PRIMARY_MODEL_NAME} | lang={language.value} | file={file.filename}")
-    result = await model.run(image_bytes, lang_enum)
+    log_lang = lang_enum.value if lang_enum is not None else "auto"
+    logger.info(f"[OCR] Running {model_name} | lang={log_lang} | file={file.filename}")
+    if model_name == QARI_MODEL_NAME:
+        return await _run_qari_raw_text(selected_model, image_bytes, file.filename)
+    if model_name == PADDLEOCR_VL_MODEL_NAME:
+        return await _run_paddleocr_vl_raw_json(selected_model, image_bytes, file.filename)
+
+    result = await selected_model.run(image_bytes, lang_enum)
     pages = _pages_from_metadata(result.metadata)
     accepted_lines = _flatten_page_lines(pages, "accepted_lines")
-    review_lines = _flatten_page_lines(pages, "review_lines")
-    flagged_lines = _flatten_page_lines(pages, "flagged_lines")
-    excluded_noise_lines = _flatten_page_lines(pages, "excluded_noise_lines")
-    excluded_lines = _flatten_page_lines(pages, "excluded_lines")
     quality = result.metadata.get("quality", {})
     response_raw_text = result.metadata.get("raw_text_before_correction", result.raw_text)
     final_text = result.metadata.get("final_text", result.raw_text)
@@ -162,7 +280,6 @@ async def run_ocr(
     tables = result.metadata.get("tables", []) or []
     totals = result.metadata.get("totals", {}) or {}
     per_line_confidence = result.metadata.get("per_line_confidence", []) or []
-    per_line_noise_score = result.metadata.get("per_line_noise_score", []) or []
     rejected_bbox_lines = result.metadata.get("rejected_bbox_lines", []) or []
     corrected_bbox_lines = result.metadata.get("corrected_bbox_lines", []) or []
     results = [ModelResult(
@@ -183,12 +300,7 @@ async def run_ocr(
         words=[WordDetail(text=w.text, confidence=w.confidence, bbox=w.bbox) for w in result.words],
         pages=pages,
         accepted_lines=accepted_lines,
-        review_lines=review_lines,
-        flagged_lines=flagged_lines,
-        excluded_noise_lines=excluded_noise_lines,
-        excluded_lines=excluded_lines,
         per_line_confidence=per_line_confidence,
-        per_line_noise_score=per_line_noise_score,
         inference_time_ms=result.inference_time_ms,
         avg_confidence=result.avg_confidence,
         error=result.error,
@@ -200,7 +312,7 @@ async def run_ocr(
 
     return OCRResponse(
         filename=file.filename,
-        language=language.value,
+        language=log_lang,
         final_text=final_text,
         text=result.raw_text,
         raw_text=response_raw_text,
@@ -215,12 +327,7 @@ async def run_ocr(
         corrected_bbox_lines=corrected_bbox_lines,
         pages=pages,
         accepted_lines=accepted_lines,
-        review_lines=review_lines,
-        flagged_lines=flagged_lines,
-        excluded_noise_lines=excluded_noise_lines,
-        excluded_lines=excluded_lines,
         per_line_confidence=per_line_confidence,
-        per_line_noise_score=per_line_noise_score,
         avg_confidence=result.avg_confidence,
         quality=quality,
         results=results,

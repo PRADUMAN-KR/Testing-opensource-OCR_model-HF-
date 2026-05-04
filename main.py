@@ -1,5 +1,5 @@
 """
-PaddleOCR pipeline — FastAPI service for document OCR (Arabic, Hindi, Punjabi, English, multilingual).
+OCR pipeline — FastAPI service for document OCR (Arabic, Hindi, Punjabi, English, multilingual).
 """
 
 from fastapi import FastAPI
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: warm up model registry. Shutdown: release GPU memory."""
-    logger.info("Initializing PaddleOCR model registry...")
+    logger.info("Initializing OCR model registry...")
     registry = ModelRegistry()
     await registry.initialize(settings.ENABLED_MODELS)
     app.state.model_registry = registry
@@ -33,8 +33,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="PaddleOCR Pipeline API",
-    description="OCR API backed by PaddleOCR (PP-OCR) with multi-pass Arabic pipeline options.",
+    title=settings.APP_NAME,
+    description="OCR API backed by selectable OCR engines, including PaddleOCR and Qari-OCR VL.",
     version="1.0.0",
     lifespan=lifespan,
 )
