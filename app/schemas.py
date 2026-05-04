@@ -27,9 +27,6 @@ class LineDetail(BaseModel):
     bbox_source: Dict[str, Any] = Field(default_factory=dict)
     bbox_valid: bool = True
     status: Optional[str] = None
-    noise_score: Optional[float] = None
-    filter_reason: Optional[str] = None
-    exclude_reason: Optional[str] = None
 
 
 class PageDetail(BaseModel):
@@ -38,13 +35,7 @@ class PageDetail(BaseModel):
     raw_text: str
     lines: List[LineDetail] = Field(default_factory=list)
     accepted_lines: List[LineDetail] = Field(default_factory=list)
-    review_lines: List[LineDetail] = Field(default_factory=list)
-    flagged_lines: List[LineDetail] = Field(default_factory=list)
-    filtered_lines: List[LineDetail] = Field(default_factory=list)
-    excluded_noise_lines: List[LineDetail] = Field(default_factory=list)
-    excluded_lines: List[LineDetail] = Field(default_factory=list)
     per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
-    per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
     layout_mode: str = "text"
     tables: List[Dict[str, Any]] = Field(default_factory=list)
     totals: Dict[str, Any] = Field(default_factory=dict)
@@ -69,12 +60,7 @@ class ModelResult(BaseModel):
     words: List[WordDetail]
     pages: List[PageDetail] = Field(default_factory=list)
     accepted_lines: List[LineDetail] = Field(default_factory=list)
-    review_lines: List[LineDetail] = Field(default_factory=list)
-    flagged_lines: List[LineDetail] = Field(default_factory=list)
-    excluded_noise_lines: List[LineDetail] = Field(default_factory=list)
-    excluded_lines: List[LineDetail] = Field(default_factory=list)
     per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
-    per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
     inference_time_ms: float
     avg_confidence: float
     error: Optional[str] = None
@@ -107,12 +93,7 @@ class OCRResponse(BaseModel):
     corrected_bbox_lines: List[Dict[str, Any]] = Field(default_factory=list)
     pages: List[PageDetail] = Field(default_factory=list)
     accepted_lines: List[LineDetail] = Field(default_factory=list)
-    review_lines: List[LineDetail] = Field(default_factory=list)
-    flagged_lines: List[LineDetail] = Field(default_factory=list)
-    excluded_noise_lines: List[LineDetail] = Field(default_factory=list)
-    excluded_lines: List[LineDetail] = Field(default_factory=list)
     per_line_confidence: List[Dict[str, Any]] = Field(default_factory=list)
-    per_line_noise_score: List[Dict[str, Any]] = Field(default_factory=list)
     avg_confidence: float = 0.0
     quality: Dict[str, Any] = Field(default_factory=dict)
     results: List[ModelResult]
@@ -176,3 +157,4 @@ class OCRRunOptionsResponse(BaseModel):
     available_model_names: List[str]
     available_languages: List[Language]
     preset_model_groups: Dict[str, List[str]]
+    language_required_by_model: Dict[str, bool] = Field(default_factory=dict)

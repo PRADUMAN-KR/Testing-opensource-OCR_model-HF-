@@ -1,205 +1,385 @@
+import argparse
+import logging
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
 
-#******************************************************
+from app.models.base import BaseOCRModel, OCRResult, SupportedLanguage
 
-# This model is not  implemented in this project  refer the V5 model for better result
-
-#******************************************************
-
-
-
-# """
-# PaddleOCR-VL — Tier 1 VLM (0.9B)
-# Smallest Tier-1 model — good accuracy, lowest VRAM (~4GB)
-# Install: pip install paddlepaddle paddleocr>=2.9.0
-# """
-
-# import logging
-# import tempfile
-# import os
-# from io import BytesIO
-# from PIL import Image
-
-# from app.models.base import BaseOCRModel, OCRResult, OCRWord, SupportedLanguage
-# from app.core.document import load_document_as_rgb_images
-
-# logger = logging.getLogger(__name__)
-
-# LANG_CONFIG = {
-#     SupportedLanguage.ENGLISH: {"lang": "en", "ocr_version": "PP-OCRv4"},
-#     SupportedLanguage.ARABIC: {"lang": "ar", "ocr_version": "PP-OCRv5"},
-#     SupportedLanguage.HINDI: {"lang": "hi", "ocr_version": "PP-OCRv5"},
-# }
+logger = logging.getLogger(__name__)
 
 
-# class PaddleOCRVLModel(BaseOCRModel):
-#     name = "paddleocr_vl"
-#     supported_languages = [
-#         SupportedLanguage.ENGLISH,
-#         SupportedLanguage.ARABIC,
-#         SupportedLanguage.HINDI,
-#     ]
-#     tier = 1
+class PaddleOCRVLModel(BaseOCRModel):
+    """
+    Official PaddleOCR-VL document parsing wrapper.
 
-#     def __init__(self, use_gpu: bool = True):
-#         self.use_gpu = use_gpu
-#         self._engines = {}
+    The official pipeline returns generated block content and layout metadata,
+    but it does not expose calibrated word confidence scores.
+    """
 
-#     def supports_all_languages(self) -> bool:
-#         return True
+    name = "paddleocr_vl"
+    supported_languages = [
+        SupportedLanguage.ENGLISH,
+        SupportedLanguage.ARABIC,
+        SupportedLanguage.HINDI,
+        SupportedLanguage.PUNJABI,
+    ]
+    tier = 1
 
-#     async def load(self) -> None:
-#         from paddleocr import PaddleOCR
-#         device = "gpu" if self.use_gpu else "cpu"
-#         for lang_enum, config in LANG_CONFIG.items():
-#             paddle_lang = config["lang"]
-#             ocr_version = config["ocr_version"]
-#             logger.info(
-#                 f"[PaddleOCR-VL] Loading VL engine for lang={paddle_lang}, ocr_version={ocr_version}"
-#             )
-#             self._engines[lang_enum] = PaddleOCR(
-#                 use_textline_orientation=True,
-#                 lang=paddle_lang,
-#                 device=device,
-#                 ocr_version=ocr_version,
-#                 use_doc_orientation_classify=True,
-#                 use_doc_unwarping=True,
-#                 text_det_thresh=0.5,
-#                 text_det_box_thresh=0.7,
-#                 text_rec_score_thresh=0.5,
-#             )
-#         logger.info("[PaddleOCR-VL] All language engines loaded.")
+    def __init__(
+        self,
+        device: str = "gpu:0",
+        pipeline_version: str = "v1",
+        use_layout_detection: bool = True,
+        use_doc_orientation_classify: bool = False,
+        use_doc_unwarping: bool = False,
+        use_chart_recognition: bool = False,
+        use_seal_recognition: bool = False,
+        use_ocr_for_image_block: bool = False,
+        format_block_content: bool = True,
+        merge_layout_blocks: bool = True,
+    ):
+        self.device = device
+        self.pipeline_version = pipeline_version
+        self.use_layout_detection = use_layout_detection
+        self.use_doc_orientation_classify = use_doc_orientation_classify
+        self.use_doc_unwarping = use_doc_unwarping
+        self.use_chart_recognition = use_chart_recognition
+        self.use_seal_recognition = use_seal_recognition
+        self.use_ocr_for_image_block = use_ocr_for_image_block
+        self.format_block_content = format_block_content
+        self.merge_layout_blocks = merge_layout_blocks
+        self._pipeline: Any | None = None
 
-#     async def unload(self) -> None:
-#         self._engines.clear()
+    def supports_all_languages(self) -> bool:
+        return True
 
-#     @staticmethod
-#     def _to_xyxy_bbox(poly) -> list[int]:
-#         """Convert polygon/box outputs into [x1, y1, x2, y2]."""
-#         if poly is None:
-#             return [0, 0, 0, 0]
-#         try:
-#             if len(poly) == 0:
-#                 return [0, 0, 0, 0]
-#         except TypeError:
-#             return [0, 0, 0, 0]
-#         xs = [int(float(p[0])) for p in poly]
-#         ys = [int(float(p[1])) for p in poly]
-#         return [min(xs), min(ys), max(xs), max(ys)]
+    async def load(self) -> None:
+        from paddleocr import PaddleOCRVL
 
-#     MIN_BOX_AREA = 150
-#     MIN_BOX_HEIGHT = 8
+        logger.info(
+            "[PaddleOCR-VL] Loading pipeline_version=%s device=%s",
+            self.pipeline_version,
+            self.device,
+        )
+        self._pipeline = PaddleOCRVL(
+            pipeline_version=self.pipeline_version,
+            device=self.device,
+            use_layout_detection=self.use_layout_detection,
+            use_doc_orientation_classify=self.use_doc_orientation_classify,
+            use_doc_unwarping=self.use_doc_unwarping,
+            use_chart_recognition=self.use_chart_recognition,
+            use_seal_recognition=self.use_seal_recognition,
+            use_ocr_for_image_block=self.use_ocr_for_image_block,
+            format_block_content=self.format_block_content,
+            merge_layout_blocks=self.merge_layout_blocks,
+        )
+        logger.info("[PaddleOCR-VL] Loaded")
 
-#     def _parse_ocr_page(self, page_result):
-#         """
-#         Parse one PaddleOCR page result.
-#         Supports both legacy tuple format and PaddleOCR 3.x dict format.
-#         Filters out tiny/spurious boxes.
-#         """
-#         raw = []
+    async def unload(self) -> None:
+        pipeline = self._pipeline
+        self._pipeline = None
+        del pipeline
+        try:
+            import paddle
 
-#         if isinstance(page_result, dict):
-#             texts = page_result.get("rec_texts") or []
-#             scores = page_result.get("rec_scores") or []
-#             polys = page_result.get("dt_polys") or page_result.get("rec_polys") or []
-#             for i in range(min(len(texts), len(scores), len(polys))):
-#                 raw.append((str(texts[i]), float(scores[i]), self._to_xyxy_bbox(polys[i])))
-#         elif isinstance(page_result, list):
-#             for line in page_result:
-#                 if not (isinstance(line, (list, tuple)) and len(line) >= 2):
-#                     continue
-#                 bbox = line[0]
-#                 text_conf = line[1]
-#                 if not (isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2):
-#                     continue
-#                 raw.append((str(text_conf[0]), float(text_conf[1]), self._to_xyxy_bbox(bbox)))
+            if paddle.device.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
+        except Exception:
+            logger.debug("[PaddleOCR-VL] CUDA cache cleanup skipped", exc_info=True)
 
-#         parsed = []
-#         for text, conf, (x1, y1, x2, y2) in raw:
-#             w, h = x2 - x1, y2 - y1
-#             if w * h < self.MIN_BOX_AREA or h < self.MIN_BOX_HEIGHT:
-#                 continue
-#             if not text or not text.strip():
-#                 continue
-#             parsed.append((text, conf, [x1, y1, x2, y2]))
-#         return parsed
+    @staticmethod
+    def _temp_suffix(image_bytes: bytes) -> str:
+        head = image_bytes[:16]
+        if head.startswith(b"%PDF"):
+            return ".pdf"
+        if head.startswith(b"\xff\xd8"):
+            return ".jpg"
+        if head.startswith(b"\x89PNG"):
+            return ".png"
+        if head.startswith((b"II*\x00", b"MM\x00*")):
+            return ".tiff"
+        if head.startswith(b"RIFF") and b"WEBP" in image_bytes[:32]:
+            return ".webp"
+        return ".bin"
 
-#     @staticmethod
-#     def _page_score(parsed_page) -> float:
-#         if not parsed_page:
-#             return 0.0
-#         return sum(conf for _, conf, _ in parsed_page)
+    @staticmethod
+    def _result_json(result: Any) -> dict:
+        if hasattr(result, "json"):
+            json_data = result.json
+            if isinstance(json_data, dict):
+                return json_data.get("res", json_data)
+        if isinstance(result, dict):
+            return result.get("res", result)
+        return {}
 
-#     def _select_all_language_page(self, img_array):
-#         best_lang = None
-#         best_page = []
-#         best_score = -1.0
-#         total_elapsed = 0.0
+    @staticmethod
+    def _result_markdown(result: Any) -> dict:
+        if not hasattr(result, "markdown"):
+            return {}
+        markdown = result.markdown
+        if not isinstance(markdown, dict):
+            return {}
+        return {
+            "page_index": markdown.get("page_index"),
+            "input_path": markdown.get("input_path"),
+            "markdown_texts": markdown.get("markdown_texts", ""),
+        }
 
-#         for lang_enum, engine in self._engines.items():
-#             t0 = self._timer()
-#             result = engine.ocr(img_array)
-#             total_elapsed += self._elapsed_ms(t0)
+    @staticmethod
+    def _block_to_line(page_index: int, line_index: int, block: dict) -> dict:
+        text = str(block.get("block_content", ""))
+        bbox = block.get("block_bbox")
+        return {
+            "page_index": page_index,
+            "line_index": line_index,
+            "text": text,
+            "raw_text": text,
+            "confidence": 0.0,
+            "bbox": bbox,
+            "bbox_source": {"source": "paddleocr_vl_block_bbox"},
+            "bbox_valid": bbox is not None,
+            "status": str(block.get("block_label", "block")),
+        }
 
-#             parsed_page = self._parse_ocr_page(result[0]) if result and result[0] else []
-#             score = self._page_score(parsed_page)
-#             if score > best_score:
-#                 best_score = score
-#                 best_lang = lang_enum
-#                 best_page = parsed_page
+    def _metadata_from_results(self, results: list[Any]) -> tuple[str, dict]:
+        pages: list[dict] = []
+        markdown_pages: list[dict] = []
+        all_blocks: list[dict] = []
+        tables: list[dict] = []
+        text_parts: list[str] = []
 
-#         return best_lang, best_page, total_elapsed
+        for fallback_index, result in enumerate(results):
+            res = self._result_json(result)
+            markdown = self._result_markdown(result)
+            if markdown:
+                markdown_pages.append(markdown)
 
-#     async def run(self, image_bytes: bytes, language: SupportedLanguage) -> OCRResult:
-#         if language != SupportedLanguage.ALL:
-#             engine = self._engines.get(language)
-#         else:
-#             engine = None
+            page_index = res.get("page_index")
+            if page_index is None:
+                page_index = fallback_index
+            page_index = int(page_index)
 
-#         if language != SupportedLanguage.ALL and not engine:
-#             return OCRResult.from_error(self.name, language.value, f"Language {language} not loaded")
+            blocks = res.get("parsing_res_list", []) or []
+            lines = [
+                self._block_to_line(page_index, line_index, block)
+                for line_index, block in enumerate(blocks)
+            ]
+            page_text = "\n".join(line["text"] for line in lines if line["text"])
+            text_parts.append(page_text)
 
-#         try:
-#             import numpy as np
-#             words = []
-#             page_texts = []
-#             total_elapsed = 0.0
-#             pages = load_document_as_rgb_images(image_bytes)
-#             resolved_page_languages = []
-#             for image in pages:
-#                 img_array = np.array(image)
-#                 if language == SupportedLanguage.ALL:
-#                     page_language, parsed_page, page_elapsed = self._select_all_language_page(img_array)
-#                     total_elapsed += page_elapsed
-#                     resolved_page_languages.append(page_language.value if page_language else None)
-#                 else:
-#                     t0 = self._timer()
-#                     result = engine.ocr(img_array)
-#                     total_elapsed += self._elapsed_ms(t0)
-#                     parsed_page = self._parse_ocr_page(result[0]) if result and result[0] else []
+            page_tables = [
+                {
+                    "page_index": page_index,
+                    "block_index": block_index,
+                    "content": block.get("block_content", ""),
+                    "bbox": block.get("block_bbox"),
+                    "label": block.get("block_label"),
+                }
+                for block_index, block in enumerate(blocks)
+                if str(block.get("block_label", "")).lower() == "table"
+            ]
+            tables.extend(page_tables)
 
-#                 lines = []
-#                 for text, conf, flat_bbox in parsed_page:
-#                     words.append(OCRWord(text=text, confidence=conf, bbox=flat_bbox))
-#                     lines.append(text)
-#                 page_texts.append("\n".join(lines))
+            for block_index, block in enumerate(blocks):
+                block_copy = dict(block)
+                block_copy["page_index"] = page_index
+                block_copy["block_index"] = block_index
+                all_blocks.append(block_copy)
 
-#             raw_text = "\n\n".join(text for text in page_texts if text)
-#             avg_conf = sum(w.confidence for w in words) / len(words) if words else 0.0
-#             metadata = {"doc_unwarping": True, "page_count": len(pages)}
-#             if language == SupportedLanguage.ALL:
-#                 metadata["best_effort_language_mode"] = "best_single_language_engine_per_page"
-#                 metadata["resolved_page_languages"] = resolved_page_languages
+            pages.append(
+                {
+                    "page_index": page_index,
+                    "text": page_text,
+                    "raw_text": page_text,
+                    "lines": lines,
+                    "accepted_lines": lines,
+                    "layout_mode": "paddleocr_vl_document_parsing",
+                    "tables": page_tables,
+                    "totals": {
+                        "block_count": len(blocks),
+                        "table_count": len(page_tables),
+                    },
+                    "avg_confidence": 0.0,
+                    "vl_json": res,
+                    "markdown": markdown,
+                }
+            )
 
-#             return OCRResult(
-#                 model_name=self.name,
-#                 language=language.value,
-#                 raw_text=raw_text,
-#                 words=words,
-#                 inference_time_ms=round(total_elapsed, 2),
-#                 avg_confidence=round(avg_conf, 4),
-#                 metadata=metadata,
-#             )
+        raw_text = "\n\n".join(text for text in text_parts if text)
+        metadata = {
+            "page_count": len(pages),
+            "final_text": raw_text,
+            "raw_text_before_correction": raw_text,
+            "selected_variant": f"official_paddleocr_vl_{self.pipeline_version}",
+            "confidence_score": 0.0,
+            "layout_mode": "paddleocr_vl_document_parsing",
+            "pages": pages,
+            "tables": tables,
+            "debug_blocks": all_blocks,
+            "markdown_pages": markdown_pages,
+            "markdown_text": "\n\n".join(
+                page.get("markdown_texts", "") for page in markdown_pages if page.get("markdown_texts")
+            ),
+            "quality": {
+                "status": "empty" if not raw_text.strip() else "generated",
+                "warnings": ["no_text_detected"] if not raw_text.strip() else [],
+                "line_count": sum(len(page["lines"]) for page in pages),
+                "char_count": len(raw_text.strip()),
+                "avg_confidence": 0.0,
+                "confidence_note": "PaddleOCR-VL does not expose calibrated word confidence scores.",
+            },
+            "generation": {
+                "pipeline": "PaddleOCRVL",
+                "pipeline_version": self.pipeline_version,
+                "device": self.device,
+                "format_block_content": self.format_block_content,
+            },
+        }
+        return raw_text, metadata
 
-#         except Exception as e:
-#             logger.exception(f"[PaddleOCR-VL] Inference error: {e}")
-#             return OCRResult.from_error(self.name, language.value, str(e))
+    async def run_raw_json(self, image_bytes: bytes) -> dict | list[dict]:
+        if self._pipeline is None:
+            raise RuntimeError("PaddleOCR-VL model is not initialized. Call load() first.")
+
+        temp_path = None
+        try:
+            suffix = self._temp_suffix(image_bytes)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(image_bytes)
+                temp_path = temp_file.name
+
+            results = self._pipeline.predict(
+                temp_path,
+                format_block_content=self.format_block_content,
+                merge_layout_blocks=self.merge_layout_blocks,
+            )
+            raw_results = [
+                result.json if hasattr(result, "json") else {"res": result}
+                for result in results
+            ]
+            if len(raw_results) == 1:
+                return raw_results[0]
+            return raw_results
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    async def run(self, image_bytes: bytes, language: SupportedLanguage | None = None) -> OCRResult:
+        if self._pipeline is None:
+            raise RuntimeError("PaddleOCR-VL model is not initialized. Call load() first.")
+
+        temp_path = None
+        try:
+            start = self._timer()
+            suffix = self._temp_suffix(image_bytes)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(image_bytes)
+                temp_path = temp_file.name
+
+            results = self._pipeline.predict(
+                temp_path,
+                format_block_content=self.format_block_content,
+                merge_layout_blocks=self.merge_layout_blocks,
+            )
+            raw_text, metadata = self._metadata_from_results(results)
+            elapsed_ms = self._elapsed_ms(start)
+
+            return OCRResult(
+                model_name=self.name,
+                language=(language.value if language is not None else "auto"),
+                raw_text=raw_text,
+                words=[],
+                inference_time_ms=elapsed_ms,
+                avg_confidence=0.0,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.exception("[PaddleOCR-VL] Inference error: %s", exc)
+            return OCRResult.from_error(
+                self.name,
+                language.value if language is not None else "",
+                str(exc),
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run PaddleOCR-VL using the official PaddleOCR pipeline.")
+    parser.add_argument(
+        "--image-path",
+        "-i",
+        required=True,
+        help="Path to the image or PDF to parse.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        default="output/paddleocr_vl",
+        help="Directory where JSON and Markdown outputs will be saved.",
+    )
+    parser.add_argument(
+        "--device",
+        default="gpu:0",
+        help="Inference device, for example gpu:0 or cpu.",
+    )
+    parser.add_argument(
+        "--pipeline-version",
+        default="v1",
+        choices=["v1", "v1.5"],
+        help="PaddleOCR-VL pipeline version. v1 uses the original PaddleOCR-VL-0.9B model.",
+    )
+    parser.add_argument(
+        "--use-layout-detection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable layout detection.",
+    )
+    parser.add_argument(
+        "--use-doc-orientation-classify",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable or disable document orientation classification.",
+    )
+    parser.add_argument(
+        "--use-doc-unwarping",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable or disable document unwarping.",
+    )
+    args = parser.parse_args()
+
+    from paddleocr import PaddleOCRVL
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pipeline = PaddleOCRVL(
+        pipeline_version=args.pipeline_version,
+        device=args.device,
+        use_layout_detection=args.use_layout_detection,
+        use_doc_orientation_classify=args.use_doc_orientation_classify,
+        use_doc_unwarping=args.use_doc_unwarping,
+        format_block_content=True,
+    )
+    output = pipeline.predict(args.image_path, format_block_content=True)
+
+    for res in output:
+        res.print()
+        res.save_to_json(save_path=str(output_dir))
+        res.save_to_markdown(save_path=str(output_dir))
+
+    print(f"\nSaved PaddleOCR-VL outputs to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
