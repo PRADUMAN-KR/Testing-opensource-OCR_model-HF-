@@ -8,11 +8,14 @@ venv/
 env/
 ENV/
 .venv/
+.uv-cache/
 
 # Django
 *.log
 local_settings.py
 db.sqlite3
+data/*.sqlite3
+data/*.sqlite3-*
 media/
 
 # Environment variables

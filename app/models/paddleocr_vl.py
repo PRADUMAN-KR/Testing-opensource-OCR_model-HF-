@@ -1,11 +1,13 @@
 import argparse
+import asyncio
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
-from app.models.base import BaseOCRModel, OCRResult, SupportedLanguage
+from app.models.base import BaseOCRModel, OCRResult
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +21,6 @@ class PaddleOCRVLModel(BaseOCRModel):
     """
 
     name = "paddleocr_vl"
-    supported_languages = [
-        SupportedLanguage.ENGLISH,
-        SupportedLanguage.ARABIC,
-        SupportedLanguage.HINDI,
-        SupportedLanguage.PUNJABI,
-    ]
     tier = 1
 
     def __init__(
@@ -51,9 +47,7 @@ class PaddleOCRVLModel(BaseOCRModel):
         self.format_block_content = format_block_content
         self.merge_layout_blocks = merge_layout_blocks
         self._pipeline: Any | None = None
-
-    def supports_all_languages(self) -> bool:
-        return True
+        self._predict_lock = threading.Lock()
 
     async def load(self) -> None:
         from paddleocr import PaddleOCRVL
@@ -239,7 +233,7 @@ class PaddleOCRVLModel(BaseOCRModel):
         }
         return raw_text, metadata
 
-    async def run_raw_json(self, image_bytes: bytes) -> dict | list[dict]:
+    def _run_raw_json_sync(self, image_bytes: bytes) -> dict | list[dict]:
         if self._pipeline is None:
             raise RuntimeError("PaddleOCR-VL model is not initialized. Call load() first.")
 
@@ -250,11 +244,12 @@ class PaddleOCRVLModel(BaseOCRModel):
                 temp_file.write(image_bytes)
                 temp_path = temp_file.name
 
-            results = self._pipeline.predict(
-                temp_path,
-                format_block_content=self.format_block_content,
-                merge_layout_blocks=self.merge_layout_blocks,
-            )
+            with self._predict_lock:
+                results = self._pipeline.predict(
+                    temp_path,
+                    format_block_content=self.format_block_content,
+                    merge_layout_blocks=self.merge_layout_blocks,
+                )
             raw_results = [
                 result.json if hasattr(result, "json") else {"res": result}
                 for result in results
@@ -269,7 +264,10 @@ class PaddleOCRVLModel(BaseOCRModel):
                 except FileNotFoundError:
                     pass
 
-    async def run(self, image_bytes: bytes, language: SupportedLanguage | None = None) -> OCRResult:
+    async def run_raw_json(self, image_bytes: bytes) -> dict | list[dict]:
+        return await asyncio.to_thread(self._run_raw_json_sync, image_bytes)
+
+    def _run_sync(self, image_bytes: bytes) -> OCRResult:
         if self._pipeline is None:
             raise RuntimeError("PaddleOCR-VL model is not initialized. Call load() first.")
 
@@ -281,19 +279,18 @@ class PaddleOCRVLModel(BaseOCRModel):
                 temp_file.write(image_bytes)
                 temp_path = temp_file.name
 
-            results = self._pipeline.predict(
-                temp_path,
-                format_block_content=self.format_block_content,
-                merge_layout_blocks=self.merge_layout_blocks,
-            )
+            with self._predict_lock:
+                results = self._pipeline.predict(
+                    temp_path,
+                    format_block_content=self.format_block_content,
+                    merge_layout_blocks=self.merge_layout_blocks,
+                )
             raw_text, metadata = self._metadata_from_results(results)
             elapsed_ms = self._elapsed_ms(start)
 
             return OCRResult(
                 model_name=self.name,
-                language=(language.value if language is not None else "auto"),
                 raw_text=raw_text,
-                words=[],
                 inference_time_ms=elapsed_ms,
                 avg_confidence=0.0,
                 metadata=metadata,
@@ -302,7 +299,6 @@ class PaddleOCRVLModel(BaseOCRModel):
             logger.exception("[PaddleOCR-VL] Inference error: %s", exc)
             return OCRResult.from_error(
                 self.name,
-                language.value if language is not None else "",
                 str(exc),
             )
         finally:
@@ -311,6 +307,9 @@ class PaddleOCRVLModel(BaseOCRModel):
                     os.remove(temp_path)
                 except FileNotFoundError:
                     pass
+
+    async def run(self, image_bytes: bytes) -> OCRResult:
+        return await asyncio.to_thread(self._run_sync, image_bytes)
 
 
 def main():

@@ -1,0 +1,29 @@
+[project]
+name = "ocr-pipeline"
+version = "0.1.0"
+description = "PaddleOCR-VL worker-based OCR API"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "paddlepaddle-gpu==3.3.1",
+    "paddleocr[doc-parser]==3.5.0",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "pydantic-settings",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "paddle-cu130"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu130/"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu130" }

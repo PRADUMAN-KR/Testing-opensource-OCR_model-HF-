@@ -5,12 +5,13 @@ Model Registry — loads configured OCR models at startup.
 import logging
 from typing import Dict, List, Optional
 
-from app.models.base import BaseOCRModel
 from app.core.config import settings
+from app.models.base import BaseOCRModel
 
 logger = logging.getLogger(__name__)
 
-AVAILABLE_MODEL_NAMES = ["qari_ocr_vl_2b", "paddleocr_vl"]
+PADDLEOCR_VL_MODEL_NAME = "paddleocr_vl"
+AVAILABLE_MODEL_NAMES = [PADDLEOCR_VL_MODEL_NAME]
 
 
 class ModelRegistry:
@@ -61,18 +62,8 @@ class ModelRegistry:
 
     def _build_model(self, name: str) -> Optional["BaseOCRModel"]:
         """Factory: maps model name → implementation class."""
-        if name == "qari_ocr_vl_2b":
-            from app.models.qari_ocr_vl_2b import QariOCRVL2BModel
-
-            return QariOCRVL2BModel(
-                model_id=settings.QARI_MODEL_ID,
-                prompt=settings.QARI_PROMPT,
-                max_new_tokens=settings.QARI_MAX_NEW_TOKENS,
-                torch_dtype=settings.QARI_TORCH_DTYPE,
-                device_map=settings.QARI_DEVICE_MAP,
-            )
-        if name == "paddleocr_vl":
-            from app.models.paddleocr_VL import PaddleOCRVLModel
+        if name == PADDLEOCR_VL_MODEL_NAME:
+            from app.models.paddleocr_vl import PaddleOCRVLModel
 
             return PaddleOCRVLModel(
                 device=settings.PADDLEOCR_VL_DEVICE,

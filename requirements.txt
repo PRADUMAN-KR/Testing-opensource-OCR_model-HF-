@@ -1,37 +1,16 @@
-# ── Core ──────────────────────────────────────────────
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.9
-pydantic>=2.7.0
-pydantic-settings>=2.3.0
+# pip install paddlepaddle-gpu==3.3.1 \
+#   -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
 
-# ── System utilities ──────────────────────────────────
-psutil>=5.9.0
-Pillow>=10.3.0
-numpy>=1.26.4
-pdf2image
+# pip install "paddleocr[doc-parser]==3.5.0"
 
-# PaddleOCR — install paddlepaddle / paddlepaddle-gpu for your OS/CUDA from:
-# https://www.paddlepaddle.org.cn/install/quick
-paddleocr[doc-parser]>=3.4.0
-
-# Qari-OCR VL 2B (Qwen2-VL + PEFT adapter)
-# Match the official Qari Colab runtime as closely as possible.
-transformers==4.49.0
-qwen-vl-utils>=0.0.14
-accelerate>=0.26.0
-peft>=0.19.1
-bitsandbytes>=0.43.0
-torchao==0.17.0
-
-# ── Dev / Testing ─────────────────────────────────────
-pytest>=8.2.0
-pytest-asyncio>=0.23.0
-httpx>=0.27.0
-torch==2.9.0
-#---------
-# python3 -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
 
 --index-url https://pypi.org/simple
 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu130/
-paddlepaddle-gpu==3.3.0
+
+paddlepaddle-gpu==3.3.1
+paddleocr[doc-parser]==3.5.0
+
+fastapi
+uvicorn
+python-multipart
+pydantic-settings

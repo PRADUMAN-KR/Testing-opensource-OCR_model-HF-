@@ -1,1 +1,1 @@
-# OCR Benchmark Pipeline
+# PaddleOCR-VL worker API

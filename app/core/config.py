@@ -17,26 +17,12 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "OCR Pipeline API"
     DEBUG: bool = False
+    OCR_TASK_DB_PATH: str = "data/ocr_tasks.sqlite3"
 
     # Active OCR models loaded at startup.
-    ENABLED_MODELS: List[str] = ["qari_ocr_vl_2b", "paddleocr_vl"]
+    ENABLED_MODELS: List[str] = ["paddleocr_vl"]
 
     GPU_DEVICE_ID: int = 0
-
-    # Preset retained for compatibility with /ocr/run/options.
-    OCR_WITHOUT_LLM_CAPABILITIES: List[str] = ["paddleocr_vl"]
-
-    # Qari-OCR VL 2B Arabic OCR settings.
-    QARI_MODEL_ID: str = "NAMAA-Space/Qari-OCR-0.2.2.1-VL-2B-Instruct"
-    QARI_MAX_NEW_TOKENS: int = 2000
-    QARI_TORCH_DTYPE: str = "auto"
-    QARI_DEVICE_MAP: str = "auto"
-    QARI_PROMPT: str = (
-        "Below is the image of one page of a document, as well as some raw textual "
-        "content that was previously extracted for it. Just return the plain text "
-        "representation of this document as if you were reading it naturally. "
-        "Do not hallucinate."
-    )
 
     # Official PaddleOCR-VL document parsing settings.
     PADDLEOCR_VL_DEVICE: str = "gpu:0"
