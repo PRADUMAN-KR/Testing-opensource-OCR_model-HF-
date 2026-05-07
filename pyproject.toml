@@ -2,7 +2,7 @@
 name = "ocr-pipeline"
 version = "0.1.0"
 description = "PaddleOCR-VL worker-based OCR API"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12"
 dependencies = [
     "paddlepaddle-gpu==3.3.1",
     "paddleocr[doc-parser]==3.5.0",
