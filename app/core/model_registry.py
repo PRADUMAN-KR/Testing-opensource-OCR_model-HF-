@@ -10,8 +10,8 @@ from app.models.base import BaseOCRModel
 
 logger = logging.getLogger(__name__)
 
-PADDLEOCR_VL_MODEL_NAME = "paddleocr_vl"
-AVAILABLE_MODEL_NAMES = [PADDLEOCR_VL_MODEL_NAME]
+QWEN_OCR_MODEL_NAME = "qwen_ocr"
+AVAILABLE_MODEL_NAMES = [QWEN_OCR_MODEL_NAME]
 
 
 class ModelRegistry:
@@ -62,23 +62,38 @@ class ModelRegistry:
 
     def _build_model(self, name: str) -> Optional["BaseOCRModel"]:
         """Factory: maps model name → implementation class."""
-        if name == PADDLEOCR_VL_MODEL_NAME:
-            from app.models.paddleocr_vl import PaddleOCRVLModel
+        if name == QWEN_OCR_MODEL_NAME:
+            from app.models.qwen_ocr import QwenOCRModel
 
-            return PaddleOCRVLModel(
-                device=settings.PADDLEOCR_VL_DEVICE,
-                pipeline_version=settings.PADDLEOCR_VL_PIPELINE_VERSION,
-                use_layout_detection=settings.PADDLEOCR_VL_USE_LAYOUT_DETECTION,
-                use_doc_orientation_classify=settings.PADDLEOCR_VL_USE_DOC_ORIENTATION_CLASSIFY,
-                use_doc_unwarping=settings.PADDLEOCR_VL_USE_DOC_UNWARPING,
-                use_chart_recognition=settings.PADDLEOCR_VL_USE_CHART_RECOGNITION,
-                use_seal_recognition=settings.PADDLEOCR_VL_USE_SEAL_RECOGNITION,
-                use_ocr_for_image_block=settings.PADDLEOCR_VL_USE_OCR_FOR_IMAGE_BLOCK,
-                format_block_content=settings.PADDLEOCR_VL_FORMAT_BLOCK_CONTENT,
-                merge_layout_blocks=settings.PADDLEOCR_VL_MERGE_LAYOUT_BLOCKS,
+            return QwenOCRModel(
+                model_id=settings.QWEN_OCR_MODEL_ID,
+                device_map=settings.QWEN_OCR_DEVICE_MAP,
+                torch_dtype=settings.QWEN_OCR_TORCH_DTYPE,
+                max_new_tokens=settings.QWEN_OCR_MAX_NEW_TOKENS,
+                prompt=settings.QWEN_OCR_PROMPT,
+                pdf_dpi=settings.QWEN_OCR_PDF_DPI,
+                max_pdf_pages=settings.QWEN_OCR_MAX_PDF_PAGES,
             )
 
         logger.warning(f"[Registry] Unknown model: {name}")
+        return None
+
+    def get_active_model(self) -> Optional["BaseOCRModel"]:
+        for name in settings.ENABLED_MODELS:
+            model = self.loaded_models.get(name)
+            if model is not None:
+                return model
+        return None
+
+    def active_model_name(self) -> Optional[str]:
+        model = self.get_active_model()
+        return getattr(model, "name", None) if model is not None else None
+
+    def active_failure_reason(self) -> Optional[str]:
+        for name in settings.ENABLED_MODELS:
+            failure_reason = self.failed_models.get(name)
+            if failure_reason:
+                return f"{name}: {failure_reason}"
         return None
 
     def get(self, name: str) -> Optional["BaseOCRModel"]:

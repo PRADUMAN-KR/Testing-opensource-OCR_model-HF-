@@ -20,21 +20,21 @@ class Settings(BaseSettings):
     OCR_TASK_DB_PATH: str = "data/ocr_tasks.sqlite3"
 
     # Active OCR models loaded at startup.
-    ENABLED_MODELS: List[str] = ["paddleocr_vl"]
+    ENABLED_MODELS: List[str] = ["qwen_ocr"]
 
     GPU_DEVICE_ID: int = 0
 
-    # Official PaddleOCR-VL document parsing settings.
-    PADDLEOCR_VL_DEVICE: str = "gpu:0"
-    PADDLEOCR_VL_PIPELINE_VERSION: str = "v1"
-    PADDLEOCR_VL_USE_LAYOUT_DETECTION: bool = True
-    PADDLEOCR_VL_USE_DOC_ORIENTATION_CLASSIFY: bool = False
-    PADDLEOCR_VL_USE_DOC_UNWARPING: bool = False
-    PADDLEOCR_VL_USE_CHART_RECOGNITION: bool = False
-    PADDLEOCR_VL_USE_SEAL_RECOGNITION: bool = False
-    PADDLEOCR_VL_USE_OCR_FOR_IMAGE_BLOCK: bool = False
-    PADDLEOCR_VL_FORMAT_BLOCK_CONTENT: bool = True
-    PADDLEOCR_VL_MERGE_LAYOUT_BLOCKS: bool = True
+    # Official Qwen image-text-to-text OCR settings.
+    QWEN_OCR_MODEL_ID: str = "Qwen/Qwen3.6-27B"
+    QWEN_OCR_DEVICE_MAP: str = "auto"
+    QWEN_OCR_TORCH_DTYPE: str = "auto"
+    QWEN_OCR_MAX_NEW_TOKENS: int = 4096
+    QWEN_OCR_PDF_DPI: int = 200
+    QWEN_OCR_MAX_PDF_PAGES: int = 20
+    QWEN_OCR_PROMPT: str = (
+        "Extract all readable text from this document image. Preserve reading order. "
+        "Use Markdown for tables. Return only the extracted text."
+    )
 
     MODEL_TIMEOUT: int = 60
     BENCHMARK_TIMEOUT: int = 300

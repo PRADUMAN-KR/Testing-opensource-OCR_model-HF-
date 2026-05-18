@@ -1,5 +1,5 @@
 """
-Endpoints for PaddleOCR-VL worker-based processing.
+Endpoints for worker-based OCR processing.
 """
 
 import asyncio
@@ -7,7 +7,6 @@ import asyncio
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
 from app.core.config import settings
-from app.core.model_registry import PADDLEOCR_VL_MODEL_NAME
 from app.schemas import (
     HealthResponse,
     OCRTaskStatusResponse,
@@ -45,31 +44,31 @@ async def _read_validated_file(file: UploadFile) -> bytes:
     return image_bytes
 
 
-def _get_paddleocr_vl_model(registry):
-    selected_model = registry.get(PADDLEOCR_VL_MODEL_NAME)
+def _get_active_ocr_model(registry):
+    selected_model = registry.get_active_model()
     if selected_model is not None:
         return selected_model
 
-    failure_reason = getattr(registry, "failed_models", {}).get(PADDLEOCR_VL_MODEL_NAME)
+    failure_reason = registry.active_failure_reason()
     raise HTTPException(
         status_code=503,
         detail=(
-            f"Configured OCR model '{PADDLEOCR_VL_MODEL_NAME}' is not loaded at startup."
+            "No configured OCR model is loaded at startup."
             + (f" Startup error: {failure_reason}" if failure_reason else "")
         ),
     )
 
 
-@router.post("/submit", response_model=OCRTaskSubmitResponse, summary="Submit OCR work to the PaddleOCR-VL worker")
+@router.post("/submit", response_model=OCRTaskSubmitResponse, summary="Submit OCR work to the configured worker")
 async def submit_ocr_task(
     file: UploadFile = File(..., description="Image or PDF file to process"),
     task_manager=Depends(get_task_manager),
     registry=Depends(get_registry),
 ):
     """
-    Upload an image/PDF, enqueue PaddleOCR-VL processing, and return a task id.
+    Upload an image/PDF, enqueue OCR processing, and return a task id.
     """
-    _get_paddleocr_vl_model(registry)
+    _get_active_ocr_model(registry)
     image_bytes = await _read_validated_file(file)
     task = await task_manager.submit(image_bytes, file.filename)
     return OCRTaskSubmitResponse(**task)
@@ -94,7 +93,7 @@ async def health_check(
     task_store=Depends(get_task_store),
 ):
     database = await asyncio.to_thread(task_store.health)
-    model_loaded = registry.get(PADDLEOCR_VL_MODEL_NAME) is not None
+    model_loaded = registry.get_active_model() is not None
     worker_running = task_manager.is_worker_running()
     is_healthy = model_loaded and worker_running and bool(database.get("ok"))
 

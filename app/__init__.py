@@ -1,1 +1,1 @@
-# PaddleOCR-VL worker API
+# Worker-based OCR API

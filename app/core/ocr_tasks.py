@@ -3,7 +3,7 @@ import logging
 from typing import Literal
 from uuid import uuid4
 
-from app.core.model_registry import PADDLEOCR_VL_MODEL_NAME, ModelRegistry
+from app.core.model_registry import ModelRegistry
 from app.core.task_store import OCRTaskStore
 
 logger = logging.getLogger(__name__)
@@ -57,11 +57,11 @@ class OCRTaskManager:
                     continue
 
                 await asyncio.to_thread(self.store.update_task, task_id, status="processing")
-                model = self.registry.get(PADDLEOCR_VL_MODEL_NAME)
+                model = self.registry.get_active_model()
                 if model is None:
-                    failure_reason = getattr(self.registry, "failed_models", {}).get(PADDLEOCR_VL_MODEL_NAME)
+                    failure_reason = self.registry.active_failure_reason()
                     raise RuntimeError(
-                        f"Configured OCR model '{PADDLEOCR_VL_MODEL_NAME}' is not loaded at startup."
+                        "No configured OCR model is loaded at startup."
                         + (f" Startup error: {failure_reason}" if failure_reason else "")
                     )
 

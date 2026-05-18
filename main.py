@@ -1,5 +1,5 @@
 """
-OCR pipeline — FastAPI service for PaddleOCR-VL document parsing.
+OCR pipeline — FastAPI service for worker-based document parsing.
 """
 
 from fastapi import FastAPI
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    description="PaddleOCR-VL worker API",
+    description="Worker-based OCR API",
     version="1.0.0",
     lifespan=lifespan,
 )
