@@ -17,38 +17,24 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "OCR Pipeline API"
     DEBUG: bool = False
+    OCR_TASK_DB_PATH: str = "data/ocr_tasks.sqlite3"
 
     # Active OCR models loaded at startup.
-    ENABLED_MODELS: List[str] = ["qari_ocr_vl_2b", "paddleocr_vl"]
+    ENABLED_MODELS: List[str] = ["qwen_ocr"]
 
     GPU_DEVICE_ID: int = 0
 
-    # Preset retained for compatibility with /ocr/run/options.
-    OCR_WITHOUT_LLM_CAPABILITIES: List[str] = ["paddleocr_vl"]
-
-    # Qari-OCR VL 2B Arabic OCR settings.
-    QARI_MODEL_ID: str = "NAMAA-Space/Qari-OCR-0.2.2.1-VL-2B-Instruct"
-    QARI_MAX_NEW_TOKENS: int = 2000
-    QARI_TORCH_DTYPE: str = "auto"
-    QARI_DEVICE_MAP: str = "auto"
-    QARI_PROMPT: str = (
-        "Below is the image of one page of a document, as well as some raw textual "
-        "content that was previously extracted for it. Just return the plain text "
-        "representation of this document as if you were reading it naturally. "
-        "Do not hallucinate."
+    # Official Qwen image-text-to-text OCR settings.
+    QWEN_OCR_MODEL_ID: str = "Qwen/Qwen3.6-27B"
+    QWEN_OCR_DEVICE_MAP: str = "auto"
+    QWEN_OCR_TORCH_DTYPE: str = "auto"
+    QWEN_OCR_MAX_NEW_TOKENS: int = 4096
+    QWEN_OCR_PDF_DPI: int = 200
+    QWEN_OCR_MAX_PDF_PAGES: int = 20
+    QWEN_OCR_PROMPT: str = (
+        "Extract all readable text from this document image. Preserve reading order. "
+        "Use Markdown for tables. Return only the extracted text."
     )
-
-    # Official PaddleOCR-VL document parsing settings.
-    PADDLEOCR_VL_DEVICE: str = "gpu:0"
-    PADDLEOCR_VL_PIPELINE_VERSION: str = "v1"
-    PADDLEOCR_VL_USE_LAYOUT_DETECTION: bool = True
-    PADDLEOCR_VL_USE_DOC_ORIENTATION_CLASSIFY: bool = False
-    PADDLEOCR_VL_USE_DOC_UNWARPING: bool = False
-    PADDLEOCR_VL_USE_CHART_RECOGNITION: bool = False
-    PADDLEOCR_VL_USE_SEAL_RECOGNITION: bool = False
-    PADDLEOCR_VL_USE_OCR_FOR_IMAGE_BLOCK: bool = False
-    PADDLEOCR_VL_FORMAT_BLOCK_CONTENT: bool = True
-    PADDLEOCR_VL_MERGE_LAYOUT_BLOCKS: bool = True
 
     MODEL_TIMEOUT: int = 60
     BENCHMARK_TIMEOUT: int = 300

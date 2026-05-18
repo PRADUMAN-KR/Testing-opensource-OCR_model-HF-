@@ -1,1 +1,1 @@
-# OCR Benchmark Pipeline
+# Worker-based OCR API

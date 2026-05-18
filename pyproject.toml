@@ -1,0 +1,25 @@
+[project]
+name = "ocr-pipeline"
+version = "0.1.0"
+description = "qwen based OCR API"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fastapi",
+    "accelerate",
+    "pillow",
+    "pymupdf",
+    "uvicorn",
+    "torch",
+    "torchvision",
+    "transformers>=5.3.0",
+    "python-multipart",
+    "pydantic-settings",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
