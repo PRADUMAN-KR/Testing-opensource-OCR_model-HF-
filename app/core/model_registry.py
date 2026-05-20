@@ -66,13 +66,21 @@ class ModelRegistry:
             from app.models.qwen_ocr import QwenOCRModel
 
             return QwenOCRModel(
+                provider=settings.QWEN_OCR_PROVIDER,
                 model_id=settings.QWEN_OCR_MODEL_ID,
+                vllm_base_url=settings.QWEN_OCR_VLLM_BASE_URL,
+                vllm_api_key=settings.QWEN_OCR_VLLM_API_KEY,
+                vllm_timeout=settings.QWEN_OCR_VLLM_TIMEOUT,
                 device_map=settings.QWEN_OCR_DEVICE_MAP,
                 torch_dtype=settings.QWEN_OCR_TORCH_DTYPE,
                 max_new_tokens=settings.QWEN_OCR_MAX_NEW_TOKENS,
                 prompt=settings.QWEN_OCR_PROMPT,
                 pdf_dpi=settings.QWEN_OCR_PDF_DPI,
                 max_pdf_pages=settings.QWEN_OCR_MAX_PDF_PAGES,
+                low_cpu_mem_usage=settings.QWEN_OCR_LOW_CPU_MEM_USAGE,
+                offload_buffers=settings.QWEN_OCR_OFFLOAD_BUFFERS,
+                offload_folder=settings.QWEN_OCR_OFFLOAD_FOLDER,
+                verbose=settings.QWEN_OCR_VERBOSE,
             )
 
         logger.warning(f"[Registry] Unknown model: {name}")
