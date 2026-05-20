@@ -25,12 +25,20 @@ class Settings(BaseSettings):
     GPU_DEVICE_ID: int = 0
 
     # Official Qwen image-text-to-text OCR settings.
+    QWEN_OCR_PROVIDER: str = "vllm"
     QWEN_OCR_MODEL_ID: str = "Qwen/Qwen3.6-27B"
+    QWEN_OCR_VLLM_BASE_URL: str = "http://localhost:8000/v1"
+    QWEN_OCR_VLLM_API_KEY: str = "EMPTY"
+    QWEN_OCR_VLLM_TIMEOUT: float = 300.0
     QWEN_OCR_DEVICE_MAP: str = "auto"
     QWEN_OCR_TORCH_DTYPE: str = "auto"
     QWEN_OCR_MAX_NEW_TOKENS: int = 4096
     QWEN_OCR_PDF_DPI: int = 200
     QWEN_OCR_MAX_PDF_PAGES: int = 20
+    QWEN_OCR_LOW_CPU_MEM_USAGE: bool = True
+    QWEN_OCR_OFFLOAD_BUFFERS: bool = True
+    QWEN_OCR_OFFLOAD_FOLDER: str = "data/qwen_offload"
+    QWEN_OCR_VERBOSE: bool = True
     QWEN_OCR_PROMPT: str = (
         "Extract all readable text from this document image. Preserve reading order. "
         "Use Markdown for tables. Return only the extracted text."
